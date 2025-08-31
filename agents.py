@@ -13,8 +13,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-
-
 class TokenUsageCallback(BaseCallbackHandler):
     def __init__(self):
         self.total_tokens = 0
