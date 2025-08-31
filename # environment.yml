@@ -1,0 +1,73 @@
+# environment.yml
+# -----------------------------------------------------------------------------
+# Use this file to recreate or share your Conda environment.
+# Run the following command to create the environment:
+#    conda env create -f environment.yml
+# To activate it:
+#    conda activate bioenv2
+# -----------------------------------------------------------------------------
+
+name: bioenv2  # Name of the Conda environment
+
+channels:
+  - conda-forge  # Preferred channel for scientific Python packages
+  - defaults
+
+dependencies:
+  # --- Core Python version ---
+  - python=3.12
+
+  # --- Core scientific stack ---
+  - numpy
+  - pandas
+  - matplotlib
+  - seaborn
+  - scikit-learn
+  - scipy
+  - statsmodels
+
+  # --- Data I/O ---
+  - openpyxl        # Excel support for pandas
+  - pillow          # Image processing
+  - faiss-cpu       # Vector search (used by LangChain)
+  - pyarrow         # Apache Arrow for fast I/O
+
+  # --- Streamlit and dashboarding ---
+  - streamlit
+  - altair
+  - pydeck
+
+  # --- NLP and utility libraries ---
+  - nltk            # Tokenization, stopwords
+  - tqdm            # Progress bars
+  - regex
+  - tenacity        # Retry logic
+
+  # --- Plotting libraries ---
+  - plotly
+  - matplotlib-base
+
+  # --- System and packaging ---
+  - pip
+  - setuptools
+  - mamba           # Fast Conda solver
+
+  # --- Install these via pip (not available or better managed via pip) ---
+  - pip:
+      - langchain
+      - langchain-openai
+      - langchain-community
+      - langchain-deepseek
+      - langsmith
+      - tiktoken
+      - python-dotenv
+      - pydantic
+      - pydantic-settings
+      - annotated-types
+      - typing-inspect
+      - requests-toolbelt
+      - aiohttp
+      - httpx
+      - dataclasses-json
+      - orjson
+      - openai
