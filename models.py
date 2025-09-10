@@ -5,10 +5,27 @@ import csv
 from io import StringIO
 import re
 import nltk
+import logging
 
-nltk.download('punkt_tab')
-nltk.download('punkt')  
-nltk.download('stopwords')
+# Configure NLTK data path and downloads in a deterministic way
+def _ensure_nltk_data():
+    """Ensure NLTK data is available with proper error handling."""
+    try:
+        # Try to use existing data first
+        nltk.data.find('tokenizers/punkt')
+        nltk.data.find('tokenizers/punkt_tab')
+        nltk.data.find('corpora/stopwords')
+    except LookupError:
+        # Only download if data is missing
+        try:
+            nltk.download('punkt', quiet=True)
+            nltk.download('punkt_tab', quiet=True)
+            nltk.download('stopwords', quiet=True)
+        except Exception as e:
+            logging.warning(f"NLTK download failed: {e}. Sentence tokenization may be limited.")
+
+# Initialize NLTK data once
+_ensure_nltk_data()
 
 
 class BiodiversityCategory(str, Enum):
@@ -22,33 +39,53 @@ class BiodiversityCategory(str, Enum):
 class Question(BaseModel):
     text: str
     relevant_excerpts: List[str] = []
-    # Add question-level scoring metrics
-    N: int = 0  # Number of relevant mentions
-    S: float = 0.0  # Specificity score (0-100)
-    M: float = 0.0  # Multiplicity/repetition score (0-100)
+    # LLM-based scoring metrics (all in 0-1 range)
+    N: float = 0.0  # Semantic relevance score (0-1): how well the question is answered
+    S: float = 0.0  # Specificity score (0-1): how detailed/specific the answer is  
+    M: float = 0.0  # Multiplicity/redundancy score (0-1): how much redundancy exists
+    # Reasoning for scoring decisions
+    scoring_rationale: str = ""
 
     def calculate_score(self) -> float:
-        """Calculate question score using N × S × (1 − M) formula"""
-        # Normalize values to 0-1 range
-        norm_n = min(self.N / 10, 1.0)  # Cap at 10 mentions
-        norm_s = self.S / 100
-        norm_m = 1 - (self.M / 100)  # Invert M score (lower is better)
-
-        # Direct formula from requirements
-        return norm_n * norm_s * norm_m
+        """Calculate question score using N × S × (1 − M) formula scaled to 1-10 range"""
+        # Validate inputs are in 0-1 range (LLM should provide normalized values)
+        if not (0 <= self.N <= 1) or not (0 <= self.S <= 1) or not (0 <= self.M <= 1):
+            logging.warning(f"Invalid score metrics (should be 0-1): N={self.N}, S={self.S}, M={self.M}")
+            return 0.0
+            
+        # Formula: N × S × (1 - M) gives a value in [0,1]
+        # N: How well question is answered (0=not answered, 1=fully answered)
+        # S: How specific/detailed the answer is (0=vague, 1=very specific)
+        # M: Redundancy level (0=no redundancy, 1=highly redundant, so (1-M) rewards low redundancy)
+        base_score = self.N * self.S * (1.0 - self.M)
+        
+        # Scale to 1-10 range: score = 1 + (base_score × 9)
+        # This maps 0.0 -> 1.0 and 1.0 -> 10.0
+        scaled_score = 1.0 + (base_score * 9.0)
+        
+        # Ensure score is bounded [1,10]
+        return max(1.0, min(10.0, scaled_score))
 
     def add_relevant_excerpt(self, excerpt: str) -> None:
-        """Add a relevant excerpt and update N count"""
-        self.relevant_excerpts.append(excerpt)
-        self.N += 1
+        """Add a relevant excerpt for reference"""
+        if excerpt and excerpt.strip():
+            self.relevant_excerpts.append(excerpt.strip())
 
+    def update_llm_scores(self, n: float, s: float, m: float, rationale: str = "") -> None:
+        """Update LLM-based scores with validation"""
+        self.N = max(0.0, min(1.0, float(n)))
+        self.S = max(0.0, min(1.0, float(s))) 
+        self.M = max(0.0, min(1.0, float(m)))
+        self.scoring_rationale = rationale or ""
+
+    # Legacy methods for backward compatibility - convert from 0-100 to 0-1 range
     def update_specificity(self, value: float) -> None:
-        """Update specificity score (0-100)"""
-        self.S = max(0, min(100, value))
+        """Legacy method - converts 0-100 range to 0-1"""
+        self.S = max(0.0, min(1.0, float(value) / 100.0))
 
     def update_multiplicity(self, value: float) -> None:
-        """Update multiplicity score (0-100)"""
-        self.M = max(0, min(100, value))
+        """Legacy method - converts 0-100 range to 0-1"""  
+        self.M = max(0.0, min(1.0, float(value) / 100.0))
 
 
 class Subcategory(BaseModel):
@@ -57,55 +94,76 @@ class Subcategory(BaseModel):
     questions: List[Question]
     category: BiodiversityCategory
 
-    # Scoring metrics at subcategory level (will be calculated from questions)
-    N: int = 0
-    S: float = 0.0
-    M: float = 0.0
+    # Aggregated scoring metrics at subcategory level (calculated from questions)
+    N: float = 0.0  # Average N across questions
+    S: float = 0.0  # Average S across questions  
+    M: float = 0.0  # Average M across questions
     
     # Dollar value allocation for this subcategory
     dollar_value: float = 0.0
 
     def calculate_score(self) -> float:
-        """Calculate subcategory score as average of question scores"""
+        """Calculate subcategory score as mean of question scores (excluding missing)"""
         if not self.questions:
             return 0.0
-        return sum(q.calculate_score() for q in self.questions) / len(self.questions)
+            
+        # Get scores for questions that have been evaluated (N > 0 or explicit scoring)
+        valid_scores = []
+        for q in self.questions:
+            score = q.calculate_score()
+            # Include questions that have been scored (N > 0 indicates LLM evaluation)
+            if q.N > 0 or score > 0:
+                valid_scores.append(score)
+        
+        if not valid_scores:
+            logging.debug(f"No valid question scores found for subcategory: {self.name}")
+            return 0.0
+            
+        return sum(valid_scores) / len(valid_scores)
 
     def add_relevant_excerpt(self, question_index: int, excerpt: str) -> None:
         """Add a relevant excerpt to a specific question"""
         if 0 <= question_index < len(self.questions):
             self.questions[question_index].add_relevant_excerpt(excerpt)
-            # Update subcategory N as sum of question Ns
+            # Update aggregated metrics after adding excerpt
             self.update_from_questions()
 
     def update_from_questions(self) -> None:
-        """Update subcategory metrics based on question metrics"""
+        """Update subcategory aggregated metrics based on question metrics"""
         if not self.questions:
+            self.N = self.S = self.M = 0.0
             return
 
-        # N is sum of all question Ns
-        self.N = sum(q.N for q in self.questions)
-
-        # S and M are weighted averages based on question N values
-        total_n = self.N
-        if total_n > 0:
-            self.S = sum(q.S * q.N for q in self.questions) / total_n
-            self.M = sum(q.M * q.N for q in self.questions) / total_n
-        else:
-            self.S = 0.0
-            self.M = 0.0
+        # Only aggregate from questions that have been evaluated (N > 0)
+        evaluated_questions = [q for q in self.questions if q.N > 0]
+        
+        if not evaluated_questions:
+            self.N = self.S = self.M = 0.0
+            return
+            
+        # Simple average of N, S, M across evaluated questions
+        self.N = sum(q.N for q in evaluated_questions) / len(evaluated_questions)
+        self.S = sum(q.S for q in evaluated_questions) / len(evaluated_questions)  
+        self.M = sum(q.M for q in evaluated_questions) / len(evaluated_questions)
+        
+        # Ensure values stay within 0-1 bounds
+        self.N = max(0.0, min(1.0, self.N))
+        self.S = max(0.0, min(1.0, self.S))
+        self.M = max(0.0, min(1.0, self.M))
 
     def update_specificity(self, value: float) -> None:
-        """Legacy method - now updates all questions with same value"""
+        """Legacy method - converts 0-100 to 0-1 and updates all questions"""
+        normalized_value = max(0.0, min(1.0, float(value) / 100.0))
         for question in self.questions:
-            question.update_specificity(value)
-        self.S = value  # Still update subcategory value for backward compatibility
+            question.S = normalized_value
+        self.update_from_questions()  # Recalculate aggregated values
 
     def update_multiplicity(self, value: float) -> None:
-        """Legacy method - now updates all questions with same value"""
+        """Legacy method - converts 0-100 to 0-1 and updates all questions"""
+        normalized_value = max(0.0, min(1.0, float(value) / 100.0))
         for question in self.questions:
-            question.update_multiplicity(value)
-        self.M = value  # Still update subcategory value for backward compatibility
+            question.M = normalized_value
+        self.update_from_questions()  # Recalculate aggregated values
 
 
 class CategoryScore(BaseModel):
@@ -113,44 +171,56 @@ class CategoryScore(BaseModel):
     subcategories: List[Subcategory]
     weight: float = 1.0  # Default weight for category
 
-    # Category-level scoring metrics (will be calculated from subcategories)
-    N: int = 0
-    S: float = 0.0
-    M: float = 0.0
+    # Category-level aggregated scoring metrics (calculated from subcategories)
+    N: float = 0.0  # Average N across subcategories
+    S: float = 0.0  # Average S across subcategories
+    M: float = 0.0  # Average M across subcategories
 
     def get_total_score(self) -> float:
-        """Calculate average score across all subcategories"""
-        if not self.subcategories:
-            return 0.0
-        return sum(sc.calculate_score() for sc in self.subcategories) / len(
-            self.subcategories
-        )
+        """Calculate mean score across subcategories (excluding missing)"""
+        return self.calculate_score()
 
     def calculate_score(self) -> float:
-        """Calculate category score as average of subcategory scores (same as get_total_score)"""
-        return self.get_total_score()
+        """Calculate category score as mean of subcategory scores (excluding missing)"""
+        if not self.subcategories:
+            return 0.0
+            
+        # Get scores for subcategories that have been evaluated
+        valid_scores = []
+        for sc in self.subcategories:
+            score = sc.calculate_score()
+            # Include subcategories that have valid question evaluations
+            if score > 0:  # Non-zero score indicates some questions were evaluated
+                valid_scores.append(score)
+        
+        if not valid_scores:
+            logging.debug(f"No valid subcategory scores found for category: {self.category.value}")
+            return 0.0
+            
+        return sum(valid_scores) / len(valid_scores)
 
     def update_from_subcategories(self) -> None:
-        """Update category metrics based on subcategory values"""
+        """Update category aggregated metrics based on subcategory values"""
         if not self.subcategories:
+            self.N = self.S = self.M = 0.0
             return
 
-        # Sum N values across all subcategories
-        self.N = sum(subcategory.N for subcategory in self.subcategories)
-
-        # Average S and M values across all subcategories (weighted by N)
-        if self.N > 0:
-            self.S = (
-                sum(subcategory.S * subcategory.N for subcategory in self.subcategories)
-                / self.N
-            )
-            self.M = (
-                sum(subcategory.M * subcategory.N for subcategory in self.subcategories)
-                / self.N
-            )
-        else:
-            self.S = 0.0
-            self.M = 0.0
+        # Only aggregate from subcategories that have been evaluated
+        evaluated_subcategories = [sc for sc in self.subcategories if sc.N > 0]
+        
+        if not evaluated_subcategories:
+            self.N = self.S = self.M = 0.0
+            return
+            
+        # Simple average of N, S, M across evaluated subcategories
+        self.N = sum(sc.N for sc in evaluated_subcategories) / len(evaluated_subcategories)
+        self.S = sum(sc.S for sc in evaluated_subcategories) / len(evaluated_subcategories)
+        self.M = sum(sc.M for sc in evaluated_subcategories) / len(evaluated_subcategories)
+        
+        # Ensure values stay within 0-1 bounds
+        self.N = max(0.0, min(1.0, self.N))
+        self.S = max(0.0, min(1.0, self.S))
+        self.M = max(0.0, min(1.0, self.M))
 
     def get_total_dollar_value(self) -> float:
         """Calculate total dollar value for this category"""
@@ -162,25 +232,25 @@ class BiodiversityReport(BaseModel):
     additional_insights: Dict[str, Any] = {
         "sentiment": {
             "overall_score": 0.0,
-            "positive_aspects": set(),
-            "negative_aspects": set(),
-            "key_emotions": set(),
+            "positive_aspects": [],
+            "negative_aspects": [],
+            "key_emotions": [],
         },
         "stakeholder": {
-            "total_stakeholders": set(),
+            "total_stakeholders": [],
             "engagement_level": 0.0,
-            "main_concerns": set(),
+            "main_concerns": [],
         },
         "biodiversity": {
             "species_count": 0,
-            "habitat_types": set(),
+            "habitat_types": [],
             "conservation_status": {},
             "impact_score": 0.0,
         },
         "social_media": {
             "engagement_score": 0.0,
             "sentiment_distribution": {},
-            "key_topics": set(),
+            "key_topics": [],
         },
     }
 
@@ -297,82 +367,90 @@ class BiodiversityReport(BaseModel):
 
     def update_insights(self, subcategory_id: str, insights: Dict[str, Any]) -> None:
         """Update additional insights from specialized agents"""
-        count = 0
+        if not insights:
+            return
+            
+        # Helper function to safely extend lists avoiding duplicates
+        def safe_extend_unique(target_list, new_items):
+            if isinstance(new_items, (list, tuple, set)):
+                for item in new_items:
+                    if item and item not in target_list:
+                        target_list.append(item)
 
         # Aggregate sentiment insights
         if "sentiment_score" in insights:
-            count += 1
-            self.additional_insights["sentiment"]["overall_score"] += insights[
-                "sentiment_score"
-            ]
-            self.additional_insights["sentiment"]["positive_aspects"].update(
+            score = insights["sentiment_score"]
+            if isinstance(score, (int, float)) and 0 <= score <= 1:
+                self.additional_insights["sentiment"]["overall_score"] += score
+                
+            safe_extend_unique(
+                self.additional_insights["sentiment"]["positive_aspects"],
                 insights.get("positive_aspects", [])
             )
-            self.additional_insights["sentiment"]["negative_aspects"].update(
+            safe_extend_unique(
+                self.additional_insights["sentiment"]["negative_aspects"],
                 insights.get("negative_aspects", [])
             )
-            self.additional_insights["sentiment"]["key_emotions"].update(
+            safe_extend_unique(
+                self.additional_insights["sentiment"]["key_emotions"],
                 insights.get("key_emotions", [])
             )
 
         # Aggregate stakeholder insights
         if "stakeholder_count" in insights:
-            count += 1
-            self.additional_insights["stakeholder"]["total_stakeholders"].update(
+            safe_extend_unique(
+                self.additional_insights["stakeholder"]["total_stakeholders"],
                 insights.get("key_stakeholders", [])
             )
-            self.additional_insights["stakeholder"]["engagement_level"] += insights[
-                "engagement_level"
-            ]
-            self.additional_insights["stakeholder"]["main_concerns"].update(
+            engagement = insights.get("engagement_level", 0)
+            if isinstance(engagement, (int, float)) and 0 <= engagement <= 1:
+                self.additional_insights["stakeholder"]["engagement_level"] += engagement
+            safe_extend_unique(
+                self.additional_insights["stakeholder"]["main_concerns"],
                 insights.get("main_concerns", [])
             )
 
         # Aggregate biodiversity insights
         if "species_count" in insights:
-            count += 1
-            self.additional_insights["biodiversity"]["species_count"] = max(
-                self.additional_insights["biodiversity"]["species_count"],
-                insights["species_count"],
-            )
-            self.additional_insights["biodiversity"]["habitat_types"].update(
+            species_count = insights["species_count"]
+            if isinstance(species_count, int) and species_count >= 0:
+                self.additional_insights["biodiversity"]["species_count"] = max(
+                    self.additional_insights["biodiversity"]["species_count"],
+                    species_count
+                )
+            safe_extend_unique(
+                self.additional_insights["biodiversity"]["habitat_types"],
                 insights.get("habitat_types", [])
             )
 
-            # Merge conservation status dictionaries
-            for status, status_count in insights.get("conservation_status", {}).items():
-                self.additional_insights["biodiversity"]["conservation_status"][
-                    status
-                ] = (
-                    self.additional_insights["biodiversity"]["conservation_status"].get(
-                        status, 0
-                    )
-                    + status_count
-                )
+            # Merge conservation status dictionaries with validation
+            conservation_status = insights.get("conservation_status", {})
+            if isinstance(conservation_status, dict):
+                for status, status_count in conservation_status.items():
+                    if isinstance(status_count, (int, float)) and status_count >= 0:
+                        current = self.additional_insights["biodiversity"]["conservation_status"].get(status, 0)
+                        self.additional_insights["biodiversity"]["conservation_status"][status] = current + status_count
 
-            self.additional_insights["biodiversity"]["impact_score"] += insights.get(
-                "impact_score", 0
-            )
+            impact_score = insights.get("impact_score", 0)
+            if isinstance(impact_score, (int, float)) and impact_score >= 0:
+                self.additional_insights["biodiversity"]["impact_score"] += impact_score
 
         # Aggregate social media insights
         if "engagement_score" in insights:
-            count += 1
-            self.additional_insights["social_media"]["engagement_score"] += insights[
-                "engagement_score"
-            ]
+            engagement_score = insights["engagement_score"]
+            if isinstance(engagement_score, (int, float)) and 0 <= engagement_score <= 1:
+                self.additional_insights["social_media"]["engagement_score"] += engagement_score
 
-            # Merge sentiment distributions
-            for sentiment, value in insights.get("sentiment_distribution", {}).items():
-                self.additional_insights["social_media"]["sentiment_distribution"][
-                    sentiment
-                ] = (
-                    self.additional_insights["social_media"][
-                        "sentiment_distribution"
-                    ].get(sentiment, 0)
-                    + value
-                )
+            # Merge sentiment distributions with validation
+            sentiment_dist = insights.get("sentiment_distribution", {})
+            if isinstance(sentiment_dist, dict):
+                for sentiment, value in sentiment_dist.items():
+                    if isinstance(value, (int, float)) and value >= 0:
+                        current = self.additional_insights["social_media"]["sentiment_distribution"].get(sentiment, 0)
+                        self.additional_insights["social_media"]["sentiment_distribution"][sentiment] = current + value
 
-            self.additional_insights["social_media"]["key_topics"].update(
+            safe_extend_unique(
+                self.additional_insights["social_media"]["key_topics"],
                 insights.get("key_topics", [])
             )
 
@@ -412,11 +490,7 @@ class BiodiversityReport(BaseModel):
                     ].items()
                 }
 
-        # Convert sets to lists for JSON serialization
-        for category in self.additional_insights.values():
-            for key, value in category.items():
-                if isinstance(value, set):
-                    category[key] = list(value)
+        # Ensure all list values are properly formatted (already lists, no conversion needed)
 
     def generate_csv_report(self, weights: Optional[Dict[BiodiversityCategory, float]] = None) -> str:
         """Generate a CSV report of the biodiversity assessment scores"""
@@ -1075,15 +1149,26 @@ def extract_sentences(text: str) -> List[str]:
     Returns:
         A list of individual sentences
     """
+    if not text or not isinstance(text, str):
+        return []
+        
     # Clean the text
     text = re.sub(r"\s+", " ", text)  # Normalize whitespace
     text = text.strip()
+    
+    if not text:
+        return []
 
-    # Use NLTK to extract sentences
-    sentences = nltk.sent_tokenize(text)
+    try:
+        # Use NLTK to extract sentences with fallback
+        sentences = nltk.sent_tokenize(text)
+    except (LookupError, Exception):
+        # Fallback to simple regex-based sentence splitting
+        sentences = re.split(r'[.!?]+', text)
 
-    # Post-process: filter out very short "sentences"
-    sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
+    # Post-process: filter out very short "sentences" and clean up
+    sentences = [s.strip() for s in sentences 
+                if s.strip() and len(s.strip()) > 10 and not s.strip().isdigit()]
 
     return sentences
 
@@ -1091,6 +1176,7 @@ def extract_sentences(text: str) -> List[str]:
 def estimate_relevant_mentions(text: str, question: str, sentence_count: int) -> int:
     """
     Estimate the number of relevant mentions based on text, question and sentence count.
+    Uses improved logic to avoid overestimation and provides more accurate N values.
 
     Args:
         text: The text to analyze
@@ -1098,84 +1184,65 @@ def estimate_relevant_mentions(text: str, question: str, sentence_count: int) ->
         sentence_count: Total number of sentences
 
     Returns:
-        Estimated number of relevant mentions
+        Estimated number of relevant mentions (0-15 range)
     """
-    # Extract key terms from the question
-    question_lower = question.lower()
+    if not text or not question or sentence_count <= 0:
+        return 0
+        
+    # Input validation
+    if not isinstance(text, str) or not isinstance(question, str):
+        return 0
+        
+    # Extract key terms from the question more intelligently
+    question_lower = question.lower().strip()
 
-    # Get the core concept of the question by removing common question prefixes
-    prefixes = [
-        "are there",
-        "is there",
-        "are",
-        "is",
-        "do",
-        "does",
-        "what",
-        "when",
-        "where",
-        "how",
-        "why",
-        "which",
-        "who",
-        "can",
-        "could",
-        "should",
-        "would",
-        "will",
-        "have",
-        "has",
-    ]
+    # Remove common question words and get meaningful terms
+    stop_words = {
+        "are", "is", "there", "clear", "clearly", "mentioned", "outlined", 
+        "described", "detailed", "included", "specific", "actions", "measures",
+        "plans", "the", "and", "or", "in", "on", "at", "to", "for", "of", "with",
+        "by", "from", "as", "that", "what", "when", "where", "how", "why", "which",
+        "who", "can", "could", "should", "would", "will", "have", "has", "been",
+        "their", "they", "them", "into", "about", "during"
+    }
+    
+    # Extract meaningful terms (length > 3, not stop words)
+    words = re.findall(r'\b\w+\b', question_lower)
+    key_terms = [word for word in words 
+                if len(word) > 3 and word not in stop_words]
+    
+    if not key_terms:
+        return 0
 
-    for prefix in prefixes:
-        if question_lower.startswith(prefix):
-            core_question = question_lower[len(prefix) :].strip()
-            break
-    else:
-        core_question = question_lower
-
-    # Extract key terms from core question
-    key_terms = [
-        term.strip()
-        for term in core_question.split()
-        if len(term.strip()) > 3
-        and term.lower()
-        not in [
-            "there",
-            "clear",
-            "clearly",
-            "about",
-            "what",
-            "when",
-            "where",
-            "their",
-            "they",
-            "them",
-            "with",
-            "from",
-            "into",
-        ]
-    ]
-
-    # Calculate relevance based on key term occurrence
+    # Count occurrences in text with better matching
     text_lower = text.lower()
-    term_count = sum(text_lower.count(term.lower()) for term in key_terms if term)
+    
+    # Use word boundaries to avoid partial matches
+    term_matches = 0
+    for term in key_terms:
+        # Count exact word matches, not substring matches
+        pattern = r'\b' + re.escape(term) + r'\b'
+        matches = len(re.findall(pattern, text_lower))
+        term_matches += min(matches, 5)  # Cap per term to avoid overweighting
 
-    # If very few matches, assume low relevance
-    if term_count < 2:
-        return max(0, min(2, sentence_count // 20))
+    # No matches means no relevance
+    if term_matches == 0:
+        return 0
 
-    # If many matches but few sentences, scale appropriately
-    if term_count > sentence_count:
-        return max(1, min(sentence_count // 5, 10))
+    # Conservative estimation based on sentence count and matches
+    # Generally, relevant mentions should be much less than total sentences
+    max_possible = min(sentence_count // 3, 10)  # At most 1/3 of sentences, cap at 10
+    
+    # Scale based on term matches but be conservative
+    if term_matches <= 2:
+        estimated = 1
+    elif term_matches <= 5:
+        estimated = min(2, max_possible)
+    elif term_matches <= 10:
+        estimated = min(3, max_possible)
+    else:
+        # Many matches - likely relevant document
+        estimated = min(max(4, sentence_count // 8), max_possible)
 
-    # For typical cases, estimate based on term density relative to sentence count
-    relevance_ratio = term_count / max(1, sentence_count)
-
-    # Apply some heuristics for typical documents
-    estimated_n = max(
-        1, min(int(sentence_count * relevance_ratio * 0.5), int(sentence_count * 0.3))
-    )
-
-    # Cap at reasonable values
-    return max(1, min(estimated_n, 15))
+    # Final bounds check
+    return max(0, min(estimated, min(15, sentence_count)))

@@ -6,11 +6,17 @@ from langchain_community.utilities import GoogleSerperAPIWrapper
 from langchain.schema import LLMResult
 import re
 import os
+import logging
 from datetime import datetime
 from dotenv import load_dotenv
+import time
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 # Load environment variables
 load_dotenv()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
 
 
 class TokenUsageCallback(BaseCallbackHandler):
@@ -32,21 +38,54 @@ class TokenUsageCallback(BaseCallbackHandler):
         self.failed_requests += 1
 
     def _calculate_cost(self, usage: dict) -> float:
-        # Cost per 1K tokens (approximate rates)
+        """Calculate cost with better model name matching and fallback handling."""
+        if not isinstance(usage, dict):
+            return 0.0
+            
+        # Updated cost per 1K tokens with more comprehensive model coverage
         rates = {
             "gpt-4": {"input": 0.03, "output": 0.06},
             "gpt-4-turbo": {"input": 0.01, "output": 0.03},
+            "gpt-4-1106-preview": {"input": 0.01, "output": 0.03},  # GPT-4 Turbo alternative name
             "gpt-3.5-turbo": {"input": 0.0015, "output": 0.002},
-            "gpt-4o-mini": {"input": 0.002, "output": 0.003},
-            "deepseek-chat": {"input": 0.002, "output": 0.002},
+            "gpt-4o": {"input": 0.005, "output": 0.015},
+            "gpt-4o-mini": {"input": 0.00015, "output": 0.0006},  # Updated rates
+            "deepseek-chat": {"input": 0.00014, "output": 0.00028},  # Updated rates
+            "deepseek-coder": {"input": 0.00014, "output": 0.00028},
         }
-        model = usage.get("model", "gpt-4o-mini")
-        rate = rates.get(model, rates["gpt-4o-mini"])
-        prompt_tokens = usage.get("prompt_tokens", 0)
-        completion_tokens = usage.get("completion_tokens", 0)
-        return (
-            prompt_tokens * rate["input"] + completion_tokens * rate["output"]
-        ) / 1000
+        
+        model_name = usage.get("model", "gpt-4o-mini")
+        
+        # Normalize model name - handle variations
+        model_key = model_name.lower().strip()
+        
+        # Try exact match first
+        rate = rates.get(model_key)
+        
+        # If no exact match, try partial matching for known patterns
+        if rate is None:
+            for known_model in rates.keys():
+                if known_model in model_key or model_key in known_model:
+                    rate = rates[known_model]
+                    break
+        
+        # Fallback to gpt-4o-mini rates if model not found
+        if rate is None:
+            rate = rates["gpt-4o-mini"]
+            logging.warning(f"Unknown model '{model_name}', using gpt-4o-mini rates for cost calculation")
+        
+        # Validate token counts
+        prompt_tokens = max(0, usage.get("prompt_tokens", 0))
+        completion_tokens = max(0, usage.get("completion_tokens", 0))
+        
+        if not isinstance(prompt_tokens, (int, float)) or not isinstance(completion_tokens, (int, float)):
+            return 0.0
+            
+        try:
+            cost = (prompt_tokens * rate["input"] + completion_tokens * rate["output"]) / 1000
+            return max(0.0, cost)  # Ensure non-negative cost
+        except (KeyError, TypeError, ZeroDivisionError):
+            return 0.0
 
 
 class AnalysisAgent(ABC):
@@ -307,60 +346,41 @@ class BiodiversityFrameworkAgent(AnalysisAgent):
 
     def _create_prompt_template(self) -> PromptTemplate:
         template = """
-        Analyze the following text in relation to biodiversity framework question:
-        
+        Evaluate how well the following text addresses the biodiversity framework question using semantic understanding.
+
         QUESTION: {question}
         
         TEXT:
         {text}
         
-        Based on a comprehensive analysis of the text, evaluate:
+        Provide three scores between 0.0 and 1.0:
         
-        1. How many SPECIFIC and DISTINCT sentences/paragraphs directly address the question? Be precise and count EXACT occurrences.
-           * A relevant mention must EXPLICITLY address the specific question asked
-           * Count each distinct relevant sentence/paragraph EXACTLY once
-           * DO NOT inflate this number - it must accurately reflect the text
-           * If no relevant mentions exist, N should be 0
-           * Scrutinize each potential mention carefully and count ONLY direct responses to the question
-           * Relevant mentions should contain substantive information, not just keyword matches
+        1. N - RELEVANCE: How well does the text address the question's core topic and meaning?
+           Use semantic understanding to determine if the question is answered explicitly or implicitly.
         
-        2. How specific and detailed (S) are these mentions on a scale of 0-100?
-           * Consider detail level, actionable information, concrete facts
-           * Higher scores for specific data, metrics, or detailed plans
-           * Lower scores for vague statements or general principles
+        2. S - SPECIFICITY: How detailed and concrete is the relevant information?
+           Consider the depth, actionability, and specificity of information related to the question.
         
-        3. What percentage of mentions are redundant or repetitive (M) on a scale of 0-100?
-           * Identify repeated information across mentions
-           * Higher scores indicate more redundancy and repetition
+        3. M - REDUNDANCY: How much repetition exists in the relevant content?
+           Assess if similar ideas or information are repeated multiple times.
         
-        YOU MUST RESPOND IN EXACTLY THIS FORMAT WITH 3 PARTS SEPARATED BY |:
-        <N>|<S>|<M>
+        Use your best judgment to score each dimension from 0.0 (none/lowest) to 1.0 (complete/highest).
+        Use the full range of scores based on your semantic analysis.
         
-        WHERE:
-        - <N>: EXACT count of relevant sentences/mentions directly addressing the question (integer)
-        - <S>: Specificity rating on scale 0-100 (how detailed and actionable)
-        - <M>: Multiplicity/redundancy percentage on scale 0-100 (how repetitive)
+        RESPONSE FORMAT: <N>|<S>|<M>
         
-        IMPORTANT:
-        - Be extremely careful with the N count - it should be accurate and verifiable
-        - Only count mentions that substantively address the question
-        - Avoid defaulting to arbitrary values (like 5) - count the actual mentions
-        - Your N value should be a number that someone can manually verify in the text
-        - For longer texts, analyze each sentence individually to avoid overcounting
-        - The system is parsing the document into individual sentences to verify your count
+        Examples:
+        0.8|0.6|0.2
+        0.3|0.9|0.4
+        0.7|0.4|0.8
         
-        EXAMPLE RESPONSES:
-        0|0|0 (If no mentions found)
-        3|65|10 (3 relevant mentions with good specificity and low redundancy)
-        12|80|40 (12 mentions with high specificity but significant redundancy)
-        
-        RESPOND WITH ONLY THE FORMATTED TEXT. NO OTHER TEXT OR EXPLANATION.
+        RESPOND WITH ONLY THE THREE NUMBERS SEPARATED BY |. NO OTHER TEXT.
         """
         return PromptTemplate(template=template, input_variables=["question", "text"])
 
     def _get_default_results(self) -> Dict[str, Any]:
         return {
-            "N": 0,
+            "N": 0.0,
             "S": 0.0,
             "M": 0.0,
         }
@@ -369,22 +389,22 @@ class BiodiversityFrameworkAgent(AnalysisAgent):
         parts = self._safe_split(response)
 
         try:
-            n_value = int(parts[0])
-            if n_value < 0:
-                n_value = 0
+            n_value = float(parts[0])
+            if not 0.0 <= n_value <= 1.0:
+                n_value = 0.0
         except (ValueError, IndexError):
-            n_value = 0
+            n_value = 0.0
 
         try:
             s_value = float(parts[1])
-            if not 0 <= s_value <= 100:
+            if not 0.0 <= s_value <= 1.0:
                 s_value = 0.0
         except (ValueError, IndexError):
             s_value = 0.0
 
         try:
             m_value = float(parts[2])
-            if not 0 <= m_value <= 100:
+            if not 0.0 <= m_value <= 1.0:
                 m_value = 0.0
         except (ValueError, IndexError):
             m_value = 0.0
@@ -395,68 +415,114 @@ class BiodiversityFrameworkAgent(AnalysisAgent):
             "M": m_value,
         }
 
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=8))
     def analyze(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """Analyze text against biodiversity framework with retry logic and validation."""
         try:
-            print("BiodiversityFrameworkAgent: Starting analysis...")
-            prompt = self._create_prompt_template()
-            chain = prompt | self.llm
-
+            logging.debug("BiodiversityFrameworkAgent: Starting analysis...")
+            
+            # Input validation
+            if not isinstance(context, dict):
+                logging.error("BiodiversityFrameworkAgent: Context must be a dictionary")
+                return self._get_default_results()
+                
             # Ensure we have both text and question
             if "text" not in context or "question" not in context:
-                print(
-                    "BiodiversityFrameworkAgent: Missing required context - text or question missing"
-                )
+                logging.error("BiodiversityFrameworkAgent: Missing required context - text or question missing")
                 return self._get_default_results()
 
-            # Get the text and question
-            text = context["text"]
-            question = context["question"]
+            text = context.get("text", "").strip()
+            question = context.get("question", "").strip()
+            
+            # Validate inputs
+            if not text or not question:
+                logging.warning("BiodiversityFrameworkAgent: Empty text or question provided")
+                return self._get_default_results()
+                
+            if not isinstance(text, str) or not isinstance(question, str):
+                logging.error("BiodiversityFrameworkAgent: Text and question must be strings")
+                return self._get_default_results()
 
             # Truncate text if it's too long (over 12,000 characters)
             max_text_length = 12000
             original_length = len(text)
             if original_length > max_text_length:
-                print(
+                logging.info(
                     f"BiodiversityFrameworkAgent: Truncating text from {original_length} to {max_text_length} characters"
                 )
                 # Take the first third and last two thirds of the allowed length to get relevant parts
-                first_part = text[: int(max_text_length * 0.33)]
-                last_part = text[-(int(max_text_length * 0.67)) :]
+                first_part = text[:int(max_text_length * 0.33)]
+                last_part = text[-(int(max_text_length * 0.67)):]
                 text = first_part + "\n...[text truncated]...\n" + last_part
 
-            print(
-                f"BiodiversityFrameworkAgent: Analyzing question: {question[:100]}..."
-            )
-            print(f"BiodiversityFrameworkAgent: Text length: {len(text)} characters")
+            logging.debug(f"BiodiversityFrameworkAgent: Analyzing question: {question[:100]}...")
+            logging.debug(f"BiodiversityFrameworkAgent: Text length: {len(text)} characters")
 
+            # Create chain with error handling
+            prompt = self._create_prompt_template()
+            if not prompt:
+                logging.error("BiodiversityFrameworkAgent: Failed to create prompt template")
+                return self._get_default_results()
+                
+            chain = prompt | self.llm
+
+            # Invoke with timeout and callbacks
             response = chain.invoke(
                 {"text": text, "question": question},
                 config={"callbacks": [self.callback_handler]},
-            ).content.strip()
-
-            print(f"BiodiversityFrameworkAgent: Got response: {response}")
+            )
+            
+            if not response or not hasattr(response, 'content'):
+                logging.error("BiodiversityFrameworkAgent: Invalid response from LLM")
+                return self._get_default_results()
+                
+            response_content = response.content.strip()
+            logging.debug(f"BiodiversityFrameworkAgent: Got response: {response_content}")
 
             # Validate response format
-            if not self._validate_response(response):
-                print(
-                    f"BiodiversityFrameworkAgent: Invalid response format: {response}"
-                )
+            if not self._validate_response(response_content):
+                logging.warning(f"BiodiversityFrameworkAgent: Invalid response format: {response_content}")
                 return self._get_default_results()
 
-            results = self._process_response(response)
-            print(
+            results = self._process_response(response_content)
+            
+            # Validate processed results
+            if not self._validate_results(results):
+                logging.warning("BiodiversityFrameworkAgent: Invalid processed results")
+                return self._get_default_results()
+                
+            logging.debug(
                 f"BiodiversityFrameworkAgent: Processed results: N={results['N']}, S={results['S']}, M={results['M']}"
             )
             return results
 
         except Exception as e:
-            print(f"BiodiversityFrameworkAgent: Error in analysis: {str(e)}")
-            import traceback
-
-            traceback.print_exc()
+            logging.error(f"BiodiversityFrameworkAgent: Error in analysis: {str(e)}")
+            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                import traceback
+                traceback.print_exc()
             return self._get_default_results()
+            
+    def _validate_results(self, results: Dict[str, Any]) -> bool:
+        """Validate that processed results are reasonable."""
+        if not isinstance(results, dict):
+            return False
+            
+        required_keys = ["N", "S", "M"]
+        for key in required_keys:
+            if key not in results:
+                return False
+                
+        # Validate N, S, M (all should be floats in 0.0-1.0 range)
+        for key in ["N", "S", "M"]:
+            val = results.get(key, -1)
+            if not isinstance(val, (int, float)) or val < 0.0 or val > 1.0:
+                return False
+                
+        return True
 
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def search_project_forums_and_reviews(project_folder_name: str, max_results: int = 10) -> str:
     """
     Search forums and Google reviews for biodiversity projects using GoogleSerperAPIWrapper
@@ -468,11 +534,18 @@ def search_project_forums_and_reviews(project_folder_name: str, max_results: int
     Returns:
         Formatted string with forum and review data
     """
-  
-    
+    # Input validation
+    if not project_folder_name or not isinstance(project_folder_name, str):
+        logging.error("Invalid project folder name provided")
+        return "Error: Invalid project folder name"
+        
+    if not isinstance(max_results, int) or max_results <= 0:
+        max_results = 10
+        
     # Check for API key
     serper_api_key = os.getenv('SERPER_API_KEY')
     if not serper_api_key:
+        logging.warning("SERPER API key not found in environment variables")
         return "SERPER API key not found in environment variables"
     
     # Extract clean project name

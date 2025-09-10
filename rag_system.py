@@ -4,11 +4,19 @@ from typing import List, Dict, Any, Optional, Tuple
 from abc import ABC, abstractmethod
 import json
 import re
+import logging
+import hashlib
+from pathlib import Path
 
+# Set environment variables for deterministic behavior
 os.environ["TOKENIZERS_PARALLELISM"] = "false"  # Prevent parallelism warning
+os.environ["PYTHONHASHSEED"] = "0"  # Ensure consistent hashing
 
 import tiktoken
 from dotenv import load_dotenv
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.callbacks.manager import get_openai_callback
 from langchain_openai import OpenAIEmbeddings
@@ -57,80 +65,210 @@ class DataLoader:
         return default
 
     @staticmethod
-    def load_pdf(file_path: str) -> List[str]:
-        """Load PDF with fallback mechanism, prioritizing UnstructuredPDFLoader"""
-        try:
-            print(f"Loading PDF: {file_path}")
+    def load_pdf(file_path: str) -> List[Document]:
+        """Load PDF with fallback mechanism and improved error handling."""
+        # Input validation
+        if not file_path or not isinstance(file_path, str):
+            logging.error("Invalid file path provided")
+            return []
             
-
+        file_path = Path(file_path)
+        
+        # Check if file exists and is readable
+        if not file_path.exists():
+            logging.error(f"PDF file does not exist: {file_path}")
+            return []
+            
+        if not file_path.is_file():
+            logging.error(f"Path is not a file: {file_path}")
+            return []
+            
+        if file_path.suffix.lower() not in ['.pdf']:
+            logging.error(f"File is not a PDF: {file_path}")
+            return []
+            
+        # Check file size (avoid processing very large files)
+        file_size = file_path.stat().st_size
+        if file_size == 0:
+            logging.warning(f"PDF file is empty: {file_path}")
+            return []
+            
+        if file_size > 100 * 1024 * 1024:  # 100MB limit
+            logging.warning(f"PDF file is very large ({file_size/1024/1024:.1f}MB): {file_path}")
+            
+        try:
+            logging.info(f"Loading PDF: {file_path}")
+            
             # Try loaders in order of preference
             loaders = [
-                ("UnstructuredPDFLoader", lambda: UnstructuredPDFLoader(file_path, strategy="auto")),
-                ("PyPDFLoader", lambda: PyPDFLoader(file_path))
+                ("UnstructuredPDFLoader", lambda: UnstructuredPDFLoader(str(file_path), strategy="auto")),
+                ("PyPDFLoader", lambda: PyPDFLoader(str(file_path)))
             ]
             
             for loader_name, loader_factory in loaders:
                 try:
                     loader = loader_factory()
                     documents = loader.load()
-                    if documents:
-                        print(f"Successfully loaded PDF with {loader_name}: {file_path}")
-                        return documents
+                    
+                    # Validate loaded documents
+                    if documents and isinstance(documents, list):
+                        # Filter out empty documents and validate content
+                        valid_documents = []
+                        for doc in documents:
+                            if hasattr(doc, 'page_content') and doc.page_content.strip():
+                                valid_documents.append(doc)
+                        
+                        if valid_documents:
+                            logging.info(f"Successfully loaded PDF with {loader_name}: {file_path} ({len(valid_documents)} pages)")
+                            return valid_documents
+                        else:
+                            logging.warning(f"{loader_name} returned only empty documents for {file_path}")
                     else:
-                        print(f"{loader_name} returned empty documents for {file_path}")
+                        logging.warning(f"{loader_name} returned no documents for {file_path}")
+                        
                 except Exception as e:
-                    print(f"Error with {loader_name} for {file_path}: {str(e)}")
+                    logging.error(f"Error with {loader_name} for {file_path}: {str(e)}")
                     continue
             
-            print(f"All PDF loaders failed for {file_path}")
+            logging.error(f"All PDF loaders failed for {file_path}")
             return []
+            
         except Exception as e:
-            print(f"Critical error loading PDF {file_path}: {str(e)}")
+            logging.error(f"Critical error loading PDF {file_path}: {str(e)}")
             return []
 
     @staticmethod
     def load_excel(file_path: str) -> pd.DataFrame:
-        try:
-            df = pd.read_excel(file_path)
-            return df
-        except Exception as e:
-            print(f"Error loading Excel {file_path}: {str(e)}")
+        """Load Excel file with validation and error handling."""
+        # Input validation
+        if not file_path or not isinstance(file_path, str):
+            logging.error("Invalid Excel file path provided")
             return pd.DataFrame()
+            
+        file_path = Path(file_path)
+        
+        # Check if file exists
+        if not file_path.exists():
+            logging.warning(f"Excel file does not exist: {file_path}")
+            return pd.DataFrame()
+            
+        if not file_path.is_file():
+            logging.error(f"Path is not a file: {file_path}")
+            return pd.DataFrame()
+            
+        # Check file extension
+        if file_path.suffix.lower() not in ['.xlsx', '.xls', '.csv']:
+            logging.error(f"File is not a supported Excel format: {file_path}")
+            return pd.DataFrame()
+            
+        try:
+            logging.info(f"Loading Excel file: {file_path}")
+            
+            if file_path.suffix.lower() == '.csv':
+                df = pd.read_csv(file_path)
+            else:
+                df = pd.read_excel(file_path)
+                
+            if df.empty:
+                logging.warning(f"Excel file is empty: {file_path}")
+                return pd.DataFrame()
+                
+            logging.info(f"Successfully loaded Excel file with {len(df)} rows: {file_path}")
+            return df
+            
+        except Exception as e:
+            logging.error(f"Error loading Excel {file_path}: {str(e)}")
+            return pd.DataFrame()
+    
+    @staticmethod
+    def create_document_hash(documents: List[Document]) -> str:
+        """Create a deterministic hash for a list of documents."""
+        if not documents:
+            return "empty"
+            
+        # Create a stable representation of documents
+        content_pieces = []
+        for doc in sorted(documents, key=lambda x: x.page_content[:100]):  # Sort for determinism
+            content_pieces.append(f"{doc.page_content[:200]}|{len(doc.page_content)}")
+            
+        combined = "|".join(content_pieces)
+        return hashlib.md5(combined.encode('utf-8')).hexdigest()[:16]
 
 
 class ChunkStrategy:
+    """Handles document chunking with deterministic behavior and validation."""
+    
     def __init__(self, pdf_chunk_size: int = 1000, tweet_chunk_size: int = 100):
         self.update_chunk_sizes(pdf_chunk_size, tweet_chunk_size)
 
     def update_chunk_sizes(self, pdf_chunk_size: int, tweet_chunk_size: int):
-        """Update chunk sizes for both splitters"""
-        self.pdf_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=pdf_chunk_size,
-            chunk_overlap=int(pdf_chunk_size * 0.1),
-            length_function=len,
-            separators=["\n\n", "\n", ".", " ", ""],
-        )
+        """Update chunk sizes for both splitters with validation."""
+        # Validate chunk sizes
+        pdf_chunk_size = max(100, min(pdf_chunk_size, 4000))  # Reasonable bounds
+        tweet_chunk_size = max(50, min(tweet_chunk_size, 500))  # Reasonable bounds
+        
+        try:
+            self.pdf_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=pdf_chunk_size,
+                chunk_overlap=int(pdf_chunk_size * 0.1),
+                length_function=len,
+                separators=["\n\n", "\n", ".", " ", ""],  # Deterministic order
+            )
 
-        self.tweet_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=tweet_chunk_size,
-            chunk_overlap=0,
-            length_function=len,
-            separators=["\n", ".", " ", ""],
-        )
+            self.tweet_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=tweet_chunk_size,
+                chunk_overlap=0,  # No overlap for short tweets
+                length_function=len,
+                separators=["\n", ".", " ", ""],  # Deterministic order
+            )
 
-        # Store sizes for reference
-        self.pdf_chunk_size = pdf_chunk_size
-        self.tweet_chunk_size = tweet_chunk_size
+            # Store sizes for reference
+            self.pdf_chunk_size = pdf_chunk_size
+            self.tweet_chunk_size = tweet_chunk_size
+            
+            logging.debug(f"Updated chunk sizes: PDF={pdf_chunk_size}, Tweet={tweet_chunk_size}")
+            
+        except Exception as e:
+            logging.error(f"Error creating text splitters: {e}")
+            raise ValueError(f"Failed to create chunk strategy: {e}")
 
     def split_documents(self, documents: List[Document]) -> List[Document]:
-        """Split documents based on their source type"""
+        """Split documents based on their source type with error handling."""
+        if not documents:
+            logging.warning("No documents provided for splitting")
+            return []
+            
+        if not isinstance(documents, list):
+            logging.error("Documents must be provided as a list")
+            return []
+            
+        # Initialize document type lists
         pdf_docs = []
         tweet_docs = []
         other_docs = []
+        invalid_docs = 0
 
-        # Separate documents by type
+        # Separate documents by type with validation
         for doc in documents:
+            # Validate document structure
+            if not hasattr(doc, 'metadata') or not hasattr(doc, 'page_content'):
+                logging.warning("Invalid document structure encountered, skipping")
+                invalid_docs += 1
+                continue
+                
+            # Ensure metadata is a dict
+            if not isinstance(doc.metadata, dict):
+                doc.metadata = {}
+                
             content_type = doc.metadata.get("content_type", "unknown")
+            
+            # Skip documents with empty content
+            if not doc.page_content or not doc.page_content.strip():
+                logging.debug("Skipping document with empty content")
+                invalid_docs += 1
+                continue
+                
+            # Categorize documents
             if content_type == "pdf":
                 pdf_docs.append(doc)
             elif content_type == "tweet":
@@ -138,33 +276,66 @@ class ChunkStrategy:
             else:
                 other_docs.append(doc)
 
+        if invalid_docs > 0:
+            logging.warning(f"Skipped {invalid_docs} invalid documents")
+
         # Process each type with appropriate splitter
-        split_pdfs = self.pdf_splitter.split_documents(pdf_docs) if pdf_docs else []
-        split_tweets = (
-            self.tweet_splitter.split_documents(tweet_docs) if tweet_docs else []
-        )
-        split_others = (
-            self.pdf_splitter.split_documents(other_docs) if other_docs else []
-        )
+        split_pdfs = []
+        split_tweets = []
+        split_others = []
+        
+        try:
+            if pdf_docs:
+                split_pdfs = self.pdf_splitter.split_documents(pdf_docs)
+                # Ensure content type is preserved
+                for doc in split_pdfs:
+                    doc.metadata["content_type"] = "pdf"
+        except Exception as e:
+            logging.error(f"Error splitting PDF documents: {e}")
+            
+        try:
+            if tweet_docs:
+                split_tweets = self.tweet_splitter.split_documents(tweet_docs)
+                # Ensure content type is preserved
+                for doc in split_tweets:
+                    doc.metadata["content_type"] = "tweet"
+        except Exception as e:
+            logging.error(f"Error splitting tweet documents: {e}")
+            
+        try:
+            if other_docs:
+                split_others = self.pdf_splitter.split_documents(other_docs)
+                # Ensure content type is preserved
+                for doc in split_others:
+                    if "content_type" not in doc.metadata:
+                        doc.metadata["content_type"] = "unknown"
+        except Exception as e:
+            logging.error(f"Error splitting other documents: {e}")
 
-        # Ensure content type is preserved in metadata
-        for doc in split_pdfs:
-            doc.metadata["content_type"] = "pdf"
-        for doc in split_tweets:
-            doc.metadata["content_type"] = "tweet"
-        for doc in split_others:
-            if "content_type" not in doc.metadata:
-                doc.metadata["content_type"] = "unknown"
-
-        print(
-            f"Split into {len(split_pdfs)} PDF chunks, {len(split_tweets)} tweet chunks, and {len(split_others)} other chunks"
+        # Combine all split documents
+        all_splits = split_pdfs + split_tweets + split_others
+        
+        logging.info(
+            f"Document splitting complete: {len(split_pdfs)} PDF chunks, "
+            f"{len(split_tweets)} tweet chunks, {len(split_others)} other chunks "
+            f"(Total: {len(all_splits)})"
         )
-        return split_pdfs + split_tweets + split_others
+        
+        return all_splits
 
     @staticmethod
     def estimate_tokens(text: str) -> int:
-        encoding = tiktoken.get_encoding("cl100k_base")
-        return len(encoding.encode(text))
+        """Estimate token count with error handling and fallback."""
+        if not text or not isinstance(text, str):
+            return 0
+            
+        try:
+            encoding = tiktoken.get_encoding("cl100k_base")
+            return len(encoding.encode(text))
+        except Exception as e:
+            logging.warning(f"Token estimation failed, using character-based estimate: {e}")
+            # Fallback: rough estimate of ~4 characters per token
+            return max(1, len(text) // 4)
 
 
 class RAGAgent:
