@@ -18,6 +18,7 @@ from langchain.prompts import PromptTemplate
 from langchain.callbacks.base import BaseCallbackHandler
 from langchain.schema import LLMResult, Document
 from langchain.chains import LLMChain
+from langchain_community.document_loaders import UnstructuredPDFLoader,PyPDFLoader
 from models import (
     BiodiversityCategory,
     Subcategory,
@@ -41,6 +42,60 @@ from langchain_community.vectorstores.faiss import FAISS
 
 # Load environment variables
 load_dotenv()
+
+
+
+class DataLoader:
+    """Handles loading and preprocessing of different data sources"""
+    
+    @staticmethod
+    def extract_field_with_fallbacks(row, field_options: List[str], default: str = "") -> str:
+        """Extract field value using fallback field names"""
+        for field in field_options:
+            if field in row and row[field]:
+                return str(row[field]).strip()
+        return default
+
+    @staticmethod
+    def load_pdf(file_path: str) -> List[str]:
+        """Load PDF with fallback mechanism, prioritizing UnstructuredPDFLoader"""
+        try:
+            print(f"Loading PDF: {file_path}")
+            
+
+            # Try loaders in order of preference
+            loaders = [
+                ("UnstructuredPDFLoader", lambda: UnstructuredPDFLoader(file_path, strategy="auto")),
+                ("PyPDFLoader", lambda: PyPDFLoader(file_path))
+            ]
+            
+            for loader_name, loader_factory in loaders:
+                try:
+                    loader = loader_factory()
+                    documents = loader.load()
+                    if documents:
+                        print(f"Successfully loaded PDF with {loader_name}: {file_path}")
+                        return documents
+                    else:
+                        print(f"{loader_name} returned empty documents for {file_path}")
+                except Exception as e:
+                    print(f"Error with {loader_name} for {file_path}: {str(e)}")
+                    continue
+            
+            print(f"All PDF loaders failed for {file_path}")
+            return []
+        except Exception as e:
+            print(f"Critical error loading PDF {file_path}: {str(e)}")
+            return []
+
+    @staticmethod
+    def load_excel(file_path: str) -> pd.DataFrame:
+        try:
+            df = pd.read_excel(file_path)
+            return df
+        except Exception as e:
+            print(f"Error loading Excel {file_path}: {str(e)}")
+            return pd.DataFrame()
 
 
 class ChunkStrategy:
@@ -110,62 +165,6 @@ class ChunkStrategy:
     def estimate_tokens(text: str) -> int:
         encoding = tiktoken.get_encoding("cl100k_base")
         return len(encoding.encode(text))
-
-
-class DataLoader:
-    """Handles loading and preprocessing of different data sources"""
-    
-    @staticmethod
-    def extract_field_with_fallbacks(row, field_options: List[str], default: str = "") -> str:
-        """Extract field value using fallback field names"""
-        for field in field_options:
-            if field in row and row[field]:
-                return str(row[field]).strip()
-        return default
-
-    @staticmethod
-    def load_pdf(file_path: str) -> List[str]:
-        """Load PDF with fallback mechanism, prioritizing UnstructuredPDFLoader"""
-        try:
-            print(f"Loading PDF: {file_path}")
-            from langchain_community.document_loaders import (
-                UnstructuredPDFLoader,
-                PyPDFLoader,
-            )
-
-            # Try loaders in order of preference
-            loaders = [
-                ("UnstructuredPDFLoader", lambda: UnstructuredPDFLoader(file_path, strategy="fast")),
-                ("PyPDFLoader", lambda: PyPDFLoader(file_path))
-            ]
-            
-            for loader_name, loader_factory in loaders:
-                try:
-                    loader = loader_factory()
-                    documents = loader.load()
-                    if documents:
-                        print(f"Successfully loaded PDF with {loader_name}: {file_path}")
-                        return documents
-                    else:
-                        print(f"{loader_name} returned empty documents for {file_path}")
-                except Exception as e:
-                    print(f"Error with {loader_name} for {file_path}: {str(e)}")
-                    continue
-            
-            print(f"All PDF loaders failed for {file_path}")
-            return []
-        except Exception as e:
-            print(f"Critical error loading PDF {file_path}: {str(e)}")
-            return []
-
-    @staticmethod
-    def load_excel(file_path: str) -> pd.DataFrame:
-        try:
-            df = pd.read_excel(file_path)
-            return df
-        except Exception as e:
-            print(f"Error loading Excel {file_path}: {str(e)}")
-            return pd.DataFrame()
 
 
 class RAGAgent:
