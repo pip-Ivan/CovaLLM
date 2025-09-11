@@ -47,7 +47,7 @@ class Question(BaseModel):
     scoring_rationale: str = ""
 
     def calculate_score(self) -> float:
-        """Calculate question score using N × S × (1 − M) formula scaled to 1-10 range"""
+        """Calculate question score using N × S × (1 − M) formula scaled to 1-100 range"""
         # Validate inputs are in 0-1 range (LLM should provide normalized values)
         if not (0 <= self.N <= 1) or not (0 <= self.S <= 1) or not (0 <= self.M <= 1):
             logging.warning(f"Invalid score metrics (should be 0-1): N={self.N}, S={self.S}, M={self.M}")
@@ -59,12 +59,12 @@ class Question(BaseModel):
         # M: Redundancy level (0=no redundancy, 1=highly redundant, so (1-M) rewards low redundancy)
         base_score = self.N * self.S * (1.0 - self.M)
         
-        # Scale to 1-10 range: score = 1 + (base_score × 9)
-        # This maps 0.0 -> 1.0 and 1.0 -> 10.0
-        scaled_score = 1.0 + (base_score * 9.0)
+        # Scale to 0-100 range: score = base_score × 100
+        # This maps 0.0 -> 0.0 and 1.0 -> 100.0
+        scaled_score = base_score * 100.0
         
-        # Ensure score is bounded [1,10]
-        return max(1.0, min(10.0, scaled_score))
+        # Ensure score is bounded [0,100]
+        return max(0.0, min(100.0, scaled_score))
 
     def add_relevant_excerpt(self, excerpt: str) -> None:
         """Add a relevant excerpt for reference"""

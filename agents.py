@@ -346,35 +346,39 @@ class BiodiversityFrameworkAgent(AnalysisAgent):
 
     def _create_prompt_template(self) -> PromptTemplate:
         template = """
-        Evaluate how well the following text addresses the biodiversity framework question using semantic understanding.
+        You are analyzing text for biodiversity framework evaluation. Read carefully and score three dimensions.
 
         QUESTION: {question}
         
         TEXT:
         {text}
         
-        Provide three scores between 0.0 and 1.0:
-        
-        1. N - RELEVANCE: How well does the text address the question's core topic and meaning?
-           Use semantic understanding to determine if the question is answered explicitly or implicitly.
-        
-        2. S - SPECIFICITY: How detailed and concrete is the relevant information?
-           Consider the depth, actionability, and specificity of information related to the question.
-        
-        3. M - REDUNDANCY: How much repetition exists in the relevant content?
-           Assess if similar ideas or information are repeated multiple times.
-        
-        Use your best judgment to score each dimension from 0.0 (none/lowest) to 1.0 (complete/highest).
-        Use the full range of scores based on your semantic analysis.
-        
-        RESPONSE FORMAT: <N>|<S>|<M>
-        
-        Examples:
-        0.8|0.6|0.2
-        0.3|0.9|0.4
-        0.7|0.4|0.8
-        
-        RESPOND WITH ONLY THE THREE NUMBERS SEPARATED BY |. NO OTHER TEXT.
+        Score each dimension from 0.0 to 1.0. Be generous in your scoring - if you find ANY connection, evidence, or detail, score accordingly:
+
+        N - RELEVANCE (0.0-1.0): Does the text relate to this question's topic?
+        • If the text mentions the topic area or related concepts: score 0.4-0.8
+        • If directly addressing the question: score 0.6-1.0
+        • Only score below 0.3 if truly unrelated
+
+        S - SPECIFICITY (0.0-1.0): How detailed is the information?
+        • If you see specific names, numbers, locations, dates, or technical terms: score 0.5-1.0
+        • If you see concrete examples or detailed descriptions: score 0.4-0.8
+        • If mostly general but some specifics: score 0.2-0.5
+        • Only score below 0.2 if extremely vague
+
+        M - REDUNDANCY (0.0-1.0): How much repetition do you observe?
+        • Most texts have some repetition, so typically score 0.2-0.7
+        • High repetition of same ideas: score 0.6-1.0
+        • Some repeated concepts: score 0.3-0.6
+        • Minimal repetition: score 0.1-0.3
+        • Perfect uniqueness is rare - avoid 0.0 unless truly unique
+
+        RESPOND WITH THREE NUMBERS: N|S|M
+
+        Examples of good scoring:
+        0.7|0.4|0.3 (relevant topic, some specifics, low repetition)
+        0.5|0.8|0.5 (moderate relevance, very specific, moderate repetition)
+        0.9|0.6|0.4 (highly relevant, detailed, some repetition)
         """
         return PromptTemplate(template=template, input_variables=["question", "text"])
 
