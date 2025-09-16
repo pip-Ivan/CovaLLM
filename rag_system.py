@@ -7,6 +7,11 @@ import re
 import logging
 import hashlib
 from pathlib import Path
+import logging
+
+from typing import List
+from docx import Document as WordDocument
+
 
 # Set environment variables for deterministic behavior
 os.environ["TOKENIZERS_PARALLELISM"] = "false"  # Prevent parallelism warning
@@ -23,17 +28,17 @@ from langchain_openai import OpenAIEmbeddings
 from langchain_openai import ChatOpenAI
 from langchain_deepseek import ChatDeepSeek
 from langchain.prompts import PromptTemplate
-from langchain.callbacks.base import BaseCallbackHandler
+#from langchain.callbacks.base import BaseCallbackHandler
 from langchain.schema import LLMResult, Document
 from langchain.chains import LLMChain
 from langchain_community.document_loaders import UnstructuredPDFLoader,PyPDFLoader
 from models import (
-    BiodiversityCategory,
-    Subcategory,
-    CategoryScore,
+  #  BiodiversityCategory,
+ #   Subcategory,
+  #  CategoryScore,
     BiodiversityReport,
     BIODIVERSITY_FRAMEWORK,
-    Question,
+#    Question,
     analyze_text_content,
 )
 from agents import (
@@ -45,11 +50,13 @@ from agents import (
 from tenacity import retry, stop_after_attempt, wait_exponential
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
-from langchain_core.runnables import RunnableSequence
+#from langchain_core.runnables import RunnableSequence
 from langchain_community.vectorstores.faiss import FAISS
 
 # Load environment variables
 load_dotenv()
+
+
 
 
 
@@ -65,51 +72,95 @@ class DataLoader:
         return default
 
     @staticmethod
-    def load_pdf(file_path: str) -> List[Document]:
+    def export_documents_to_word(documents: List[Document], output_path: str) -> bool:
+        """Export loaded documents to Word file for debugging purposes"""
+        try:
+            word_doc = WordDocument()
+            
+            # Add title
+            title = word_doc.add_heading('PDF Content Debug Export', 0)
+            word_doc.add_paragraph(f'Total pages extracted: {len(documents)}')
+            word_doc.add_paragraph('')
+            
+            # Add each document's content
+            for i, doc in enumerate(documents, 1):
+                # Add page header
+                word_doc.add_heading(f'Page {i}', level=1)
+                
+                # Add metadata if available
+                if hasattr(doc, 'metadata') and doc.metadata:
+                    word_doc.add_heading('Metadata:', level=2)
+                    for key, value in doc.metadata.items():
+                        word_doc.add_paragraph(f'{key}: {value}')
+                    word_doc.add_paragraph('')
+                
+                # Add content
+                word_doc.add_heading('Content:', level=2)
+                content = doc.page_content.strip()
+                if content:
+                    word_doc.add_paragraph(content)
+                else:
+                    word_doc.add_paragraph('[Empty content]')
+                
+                # Add separator between pages
+                if i < len(documents):
+                    word_doc.add_page_break()
+            
+            # Save the document
+            word_doc.save(output_path)
+            logging.info(f"Debug Word file saved: {output_path}")
+            return True
+            
+        except Exception as e:
+            logging.error(f"Failed to export to Word file: {str(e)}")
+            return False
+
+    @staticmethod
+    def load_pdf(file_path: str, debug_export: bool = True, debug_output_dir: str = None) -> List[Document]:
         """Load PDF with fallback mechanism and improved error handling."""
         # Input validation
         if not file_path or not isinstance(file_path, str):
             logging.error("Invalid file path provided")
             return []
-            
+
         file_path = Path(file_path)
-        
+
         # Check if file exists and is readable
         if not file_path.exists():
             logging.error(f"PDF file does not exist: {file_path}")
             return []
-            
+
         if not file_path.is_file():
             logging.error(f"Path is not a file: {file_path}")
             return []
-            
+
         if file_path.suffix.lower() not in ['.pdf']:
             logging.error(f"File is not a PDF: {file_path}")
             return []
-            
+
         # Check file size (avoid processing very large files)
         file_size = file_path.stat().st_size
         if file_size == 0:
             logging.warning(f"PDF file is empty: {file_path}")
             return []
-            
+
         if file_size > 100 * 1024 * 1024:  # 100MB limit
             logging.warning(f"PDF file is very large ({file_size/1024/1024:.1f}MB): {file_path}")
-            
+
         try:
             logging.info(f"Loading PDF: {file_path}")
-            
+
             # Try loaders in order of preference
             loaders = [
                 ("UnstructuredPDFLoader", lambda: UnstructuredPDFLoader(str(file_path), strategy="auto")),
                 ("PyPDFLoader", lambda: PyPDFLoader(str(file_path)))
             ]
-            
+
             for loader_name, loader_factory in loaders:
                 try:
                     loader = loader_factory()
                     documents = loader.load()
-                    
+
                     # Validate loaded documents
                     if documents and isinstance(documents, list):
                         # Filter out empty documents and validate content
@@ -117,22 +168,36 @@ class DataLoader:
                         for doc in documents:
                             if hasattr(doc, 'page_content') and doc.page_content.strip():
                                 valid_documents.append(doc)
-                        
+
                         if valid_documents:
                             logging.info(f"Successfully loaded PDF with {loader_name}: {file_path} ({len(valid_documents)} pages)")
+                            
+                            # DEBUG: Export to Word file if requested
+                            if debug_export and valid_documents:
+                                if debug_output_dir:
+                                    output_dir = Path(debug_output_dir)
+                                else:
+                                    output_dir = file_path.parent
+                                
+                                output_dir.mkdir(exist_ok=True)
+                                debug_filename = f"debug_{file_path.stem}_extracted.docx"
+                                debug_path = output_dir / debug_filename
+                                
+                                DataLoader.export_documents_to_word(valid_documents, str(debug_path))
+                            
                             return valid_documents
                         else:
                             logging.warning(f"{loader_name} returned only empty documents for {file_path}")
                     else:
                         logging.warning(f"{loader_name} returned no documents for {file_path}")
-                        
+
                 except Exception as e:
                     logging.error(f"Error with {loader_name} for {file_path}: {str(e)}")
                     continue
-            
+
             logging.error(f"All PDF loaders failed for {file_path}")
             return []
-            
+
         except Exception as e:
             logging.error(f"Critical error loading PDF {file_path}: {str(e)}")
             return []
@@ -980,7 +1045,7 @@ class RAGSystem:
             and not d.startswith(".")
         ]
 
-    def set_current_project(self, project_name: str) -> None:
+    def set_current_project(self, project_name: str,rebuild_vector: bool = True ) -> None:
         """Set the current project and load its data"""
         project_path = os.path.join(self.base_directory, project_name)
         if not os.path.exists(project_path):
@@ -1012,65 +1077,69 @@ class RAGSystem:
 
         # Load or create vector store
         vector_store_path = os.path.join(self.vector_store_dir, f"{project_name}_store")
-        try:
-            if os.path.exists(vector_store_path):
-                print(f"Loading existing vector store for project {project_name}...")
-                self.vectorstore = FAISS.load_local(
-                    vector_store_path,
-                    self.embeddings,
-                    allow_dangerous_deserialization=True,
-                )
-
-                # Verify content types in loaded vector store
-                test_docs = self.vectorstore.similarity_search("test", k=10)
-                pdf_count = sum(
-                    1 for doc in test_docs if doc.metadata.get("content_type") == "pdf"
-                )
-                tweet_count = sum(
-                    1
-                    for doc in test_docs
-                    if doc.metadata.get("content_type") == "tweet"
-                )
-                print(
-                    f"Vector store loaded with {pdf_count} PDFs and {tweet_count} tweets in sample"
-                )
-
-                # If no PDFs found in sample, try a more targeted search
-                if pdf_count == 0 and test_docs:
-                    # Try a more specific search that might target PDF content
-                    pdf_test_docs = self.vectorstore.similarity_search(
-                        "report document biodiversity", k=10
+        if rebuild_vector:
+           print("Rebuild requested — recreating vector store...")
+           self.process_project_data(project_path, vector_store_path)
+        else:
+            try:
+                if os.path.exists(vector_store_path):
+                    print(f"Loading existing vector store for project {project_name}...")
+                    self.vectorstore = FAISS.load_local(
+                        vector_store_path,
+                        self.embeddings,
+                        allow_dangerous_deserialization=True,
                     )
+
+                    # Verify content types in loaded vector store
+                    test_docs = self.vectorstore.similarity_search("test", k=10)
                     pdf_count = sum(
+                        1 for doc in test_docs if doc.metadata.get("content_type") == "pdf"
+                    )
+                    tweet_count = sum(
                         1
-                        for doc in pdf_test_docs
-                        if doc.metadata.get("content_type") == "pdf"
+                        for doc in test_docs
+                        if doc.metadata.get("content_type") == "tweet"
                     )
-                    print(f"Secondary check: found {pdf_count} PDFs in targeted search")
-
-                # If still no content types found or no PDFs, we need to rebuild the vector store
-                if (pdf_count == 0 and tweet_count == 0 and test_docs) or (
-                    pdf_count == 0 and test_docs
-                ):
                     print(
-                        "Warning: No PDF content found in vector store. Rebuilding..."
+                        f"Vector store loaded with {pdf_count} PDFs and {tweet_count} tweets in sample"
                     )
-                    self.process_project_data(project_path, vector_store_path)
+
+                    # If no PDFs found in sample, try a more targeted search
+                    if pdf_count == 0 and test_docs:
+                        # Try a more specific search that might target PDF content
+                        pdf_test_docs = self.vectorstore.similarity_search(
+                            "report document biodiversity", k=10
+                        )
+                        pdf_count = sum(
+                            1
+                            for doc in pdf_test_docs
+                            if doc.metadata.get("content_type") == "pdf"
+                        )
+                        print(f"Secondary check: found {pdf_count} PDFs in targeted search")
+
+                    # If still no content types found or no PDFs, we need to rebuild the vector store
+                    if (pdf_count == 0 and tweet_count == 0 and test_docs) or (
+                        pdf_count == 0 and test_docs
+                    ):
+                        print(
+                            "Warning: No PDF content found in vector store. Rebuilding..."
+                        )
+                        self.process_project_data(project_path, vector_store_path)
+                    else:
+                        print("Vector store loaded successfully")
+
+                        # Connect the primary agent to the vectorstore
+                        if "primary" in self.agents:
+                            self.agents["primary"].set_vectorstore(self.vectorstore)
+
+                        return
                 else:
-                    print("Vector store loaded successfully")
-
-                    # Connect the primary agent to the vectorstore
-                    if "primary" in self.agents:
-                        self.agents["primary"].set_vectorstore(self.vectorstore)
-
-                    return
-            else:
-                print("No existing vector store found. Creating new one...")
+                    print("No existing vector store found. Creating new one...")
+                    self.process_project_data(project_path, vector_store_path)
+            except Exception as e:
+                print(f"Error loading vector store: {str(e)}")
+                print("Creating new vector store...")
                 self.process_project_data(project_path, vector_store_path)
-        except Exception as e:
-            print(f"Error loading vector store: {str(e)}")
-            print("Creating new vector store...")
-            self.process_project_data(project_path, vector_store_path)
 
         # Connect the primary agent to the vectorstore after processing
         if "primary" in self.agents:
@@ -1596,3 +1665,8 @@ class RAGSystem:
 
     def get_token_stats(self) -> Dict[str, Dict[str, Any]]:
         return {name: agent.get_stats() for name, agent in self.agents.items()}
+
+
+
+
+

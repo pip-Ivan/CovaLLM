@@ -39,53 +39,77 @@ class BiodiversityCategory(str, Enum):
 class Question(BaseModel):
     text: str
     relevant_excerpts: List[str] = []
-    # LLM-based scoring metrics (all in 0-1 range)
-    N: float = 0.0  # Semantic relevance score (0-1): how well the question is answered
-    S: float = 0.0  # Specificity score (0-1): how detailed/specific the answer is  
-    M: float = 0.0  # Multiplicity/redundancy score (0-1): how much redundancy exists
+    # Scoring metrics matching exact definitions
+    N: int = 0      # Number of Mentions: Count of sentences that mention the target content (integer, can be 0)
+    S: float = 0.0  # Specificity of Mention: Percentage 0% < S ≤ 100% (cannot be 0%)
+    M: float = 0.0  # Multiplicity: Percentage 0% ≤ M ≤ 100% of mentions that repeat content
     # Reasoning for scoring decisions
     scoring_rationale: str = ""
 
     def calculate_score(self) -> float:
-        """Calculate question score using N × S × (1 − M) formula scaled to 1-100 range"""
-        # Validate inputs are in 0-1 range (LLM should provide normalized values)
-        if not (0 <= self.N <= 1) or not (0 <= self.S <= 1) or not (0 <= self.M <= 1):
-            logging.warning(f"Invalid score metrics (should be 0-1): N={self.N}, S={self.S}, M={self.M}")
+        """Calculate question score using N × S × (1 − M) formula with correct definitions"""
+        # Validate inputs match definitions
+        if self.N < 0 or not isinstance(self.N, int):
+            logging.warning(f"Invalid N (should be non-negative integer): N={self.N}")
+            return 0.0
+        if not (0 <= self.S <= 100):
+            logging.warning(f"Invalid S (should be 0% < S ≤ 100%): S={self.S}")
+            return 0.0
+        if not (0 <= self.M <= 100):
+            logging.warning(f"Invalid M (should be 0% ≤ M ≤ 100%): M={self.M}")
             return 0.0
             
-        # Formula: N × S × (1 - M) gives a value in [0,1]
-        # N: How well question is answered (0=not answered, 1=fully answered)
-        # S: How specific/detailed the answer is (0=vague, 1=very specific)
-        # M: Redundancy level (0=no redundancy, 1=highly redundant, so (1-M) rewards low redundancy)
-        base_score = self.N * self.S * (1.0 - self.M)
+        # If no mentions found, score is 0
+        if self.N == 0:
+            return 0.0
+            
+        # Formula: N × S × (1 - M/100) 
+        # N: Count of sentences mentioning target content (integer)
+        # S: Specificity percentage (0% < S ≤ 100%)
+        # M: Multiplicity percentage (0% ≤ M ≤ 100%), so (1 - M/100) rewards low redundancy
         
-        # Scale to 0-100 range: score = base_score × 100
-        # This maps 0.0 -> 0.0 and 1.0 -> 100.0
-        scaled_score = base_score * 100.0
+        # Convert percentages to decimals for calculation
+        s_decimal = self.S / 100.0  # Convert S from percentage to 0.0-1.0
+        m_decimal = self.M / 100.0  # Convert M from percentage to 0.0-1.0
+        
+        # Apply formula: N × S × (1 - M)
+        score = self.N * s_decimal * (1.0 - m_decimal)
+        
+        # Scale to 0-100 range for final output
+        final_score = score * 100.0
         
         # Ensure score is bounded [0,100]
-        return max(0.0, min(100.0, scaled_score))
+        return max(0.0, min(100.0, final_score))
 
     def add_relevant_excerpt(self, excerpt: str) -> None:
         """Add a relevant excerpt for reference"""
         if excerpt and excerpt.strip():
             self.relevant_excerpts.append(excerpt.strip())
 
-    def update_llm_scores(self, n: float, s: float, m: float, rationale: str = "") -> None:
-        """Update LLM-based scores with validation"""
-        self.N = max(0.0, min(1.0, float(n)))
-        self.S = max(0.0, min(1.0, float(s))) 
-        self.M = max(0.0, min(1.0, float(m)))
+    def update_llm_scores(self, n: int, s: float, m: float, rationale: str = "") -> None:
+        """Update scores with validation matching exact definitions"""
+        # N: Must be non-negative integer (count of sentences)
+        self.N = max(0, int(n))
+        
+        # S: Must be percentage 0% < S ≤ 100% (cannot be 0%)
+        if s <= 0:
+            self.S = 1.0  # Minimum allowed value
+        else:
+            self.S = max(1.0, min(100.0, float(s)))
+            
+        # M: Must be percentage 0% ≤ M ≤ 100% (can be 0%)
+        self.M = max(0.0, min(100.0, float(m)))
+        
         self.scoring_rationale = rationale or ""
 
-    # Legacy methods for backward compatibility - convert from 0-100 to 0-1 range
+    # Legacy methods for backward compatibility
     def update_specificity(self, value: float) -> None:
-        """Legacy method - converts 0-100 range to 0-1"""
-        self.S = max(0.0, min(1.0, float(value) / 100.0))
+        """Legacy method - now expects percentage value 0-100"""
+        self.S = max(1.0, min(100.0, float(value)))  # S cannot be 0%
 
     def update_multiplicity(self, value: float) -> None:
-        """Legacy method - converts 0-100 range to 0-1"""  
-        self.M = max(0.0, min(1.0, float(value) / 100.0))
+        """Legacy method - now expects percentage value 0-100"""  
+        self.M = max(0.0, min(100.0, float(value)))
 
 
 class Subcategory(BaseModel):
@@ -95,9 +119,9 @@ class Subcategory(BaseModel):
     category: BiodiversityCategory
 
     # Aggregated scoring metrics at subcategory level (calculated from questions)
-    N: float = 0.0  # Average N across questions
-    S: float = 0.0  # Average S across questions  
-    M: float = 0.0  # Average M across questions
+    N: int = 0      # Sum of sentence counts across questions
+    S: float = 0.0  # Average specificity percentage across questions  
+    M: float = 0.0  # Average multiplicity percentage across questions
     
     # Dollar value allocation for this subcategory
     dollar_value: float = 0.0
@@ -131,38 +155,45 @@ class Subcategory(BaseModel):
     def update_from_questions(self) -> None:
         """Update subcategory aggregated metrics based on question metrics"""
         if not self.questions:
-            self.N = self.S = self.M = 0.0
+            self.N = 0
+            self.S = self.M = 0.0
             return
 
         # Only aggregate from questions that have been evaluated (N > 0)
         evaluated_questions = [q for q in self.questions if q.N > 0]
         
         if not evaluated_questions:
-            self.N = self.S = self.M = 0.0
+            self.N = 0
+            self.S = self.M = 0.0
             return
             
-        # Simple average of N, S, M across evaluated questions
-        self.N = sum(q.N for q in evaluated_questions) / len(evaluated_questions)
+        # Aggregation matching definitions:
+        # N: Sum of sentence counts across all questions
+        self.N = sum(q.N for q in evaluated_questions)
+        
+        # S: Average specificity percentage across evaluated questions
         self.S = sum(q.S for q in evaluated_questions) / len(evaluated_questions)  
+        
+        # M: Average multiplicity percentage across evaluated questions
         self.M = sum(q.M for q in evaluated_questions) / len(evaluated_questions)
         
-        # Ensure values stay within 0-1 bounds
-        self.N = max(0.0, min(1.0, self.N))
-        self.S = max(0.0, min(1.0, self.S))
-        self.M = max(0.0, min(1.0, self.M))
+        # Ensure values stay within correct bounds
+        self.N = max(0, self.N)  # N is count, cannot be negative
+        self.S = max(1.0, min(100.0, self.S))  # S: 0% < S ≤ 100%
+        self.M = max(0.0, min(100.0, self.M))  # M: 0% ≤ M ≤ 100%
 
     def update_specificity(self, value: float) -> None:
-        """Legacy method - converts 0-100 to 0-1 and updates all questions"""
-        normalized_value = max(0.0, min(1.0, float(value) / 100.0))
+        """Legacy method - now expects percentage value 0-100"""
+        percentage_value = max(1.0, min(100.0, float(value)))  # S cannot be 0%
         for question in self.questions:
-            question.S = normalized_value
+            question.S = percentage_value
         self.update_from_questions()  # Recalculate aggregated values
 
     def update_multiplicity(self, value: float) -> None:
-        """Legacy method - converts 0-100 to 0-1 and updates all questions"""
-        normalized_value = max(0.0, min(1.0, float(value) / 100.0))
+        """Legacy method - now expects percentage value 0-100"""
+        percentage_value = max(0.0, min(100.0, float(value)))
         for question in self.questions:
-            question.M = normalized_value
+            question.M = percentage_value
         self.update_from_questions()  # Recalculate aggregated values
 
 
@@ -172,9 +203,9 @@ class CategoryScore(BaseModel):
     weight: float = 1.0  # Default weight for category
 
     # Category-level aggregated scoring metrics (calculated from subcategories)
-    N: float = 0.0  # Average N across subcategories
-    S: float = 0.0  # Average S across subcategories
-    M: float = 0.0  # Average M across subcategories
+    N: int = 0      # Sum of sentence counts across subcategories
+    S: float = 0.0  # Average specificity percentage across subcategories
+    M: float = 0.0  # Average multiplicity percentage across subcategories
 
     def get_total_score(self) -> float:
         """Calculate mean score across subcategories (excluding missing)"""

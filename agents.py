@@ -344,72 +344,160 @@ class BiodiversityFrameworkAgent(AnalysisAgent):
         super().__init__(llm)
         self.expected_parts = 3  # N, S, M values
 
-    def _create_prompt_template(self) -> PromptTemplate:
+    def _create_prompt_template_old(self) -> PromptTemplate:
         template = """
-        You are analyzing text for biodiversity framework evaluation. Read carefully and score three dimensions.
+        Analyze the text to answer a biodiversity framework question. You must provide exact counts and percentages.
 
         QUESTION: {question}
         
         TEXT:
         {text}
         
-        Score each dimension from 0.0 to 1.0. Be generous in your scoring - if you find ANY connection, evidence, or detail, score accordingly:
+        Count and measure the following precisely:
 
-        N - RELEVANCE (0.0-1.0): Does the text relate to this question's topic?
-        • If the text mentions the topic area or related concepts: score 0.4-0.8
-        • If directly addressing the question: score 0.6-1.0
-        • Only score below 0.3 if truly unrelated
+        N - NUMBER OF MENTIONS: Count the exact number of sentences that mention the target content related to this question.
+        • Count each sentence that directly addresses or relates to the question
+        • Count distinct sentences only (do not double-count)
+        • If no sentences mention the topic, N = 0
+        • Provide the actual count as an integer (examples: 0, 1, 3, 7, 12)
 
-        S - SPECIFICITY (0.0-1.0): How detailed is the information?
-        • If you see specific names, numbers, locations, dates, or technical terms: score 0.5-1.0
-        • If you see concrete examples or detailed descriptions: score 0.4-0.8
-        • If mostly general but some specifics: score 0.2-0.5
-        • Only score below 0.2 if extremely vague
+        S - SPECIFICITY PERCENTAGE: What percentage (1-100%) reflects how specific the mentions are?
+        • Consider detail level: specific data, metrics, concrete actions, technical terms
+        • 80-100%: Very specific with concrete details, data, metrics
+        • 50-79%: Moderately specific with some concrete information
+        • 20-49%: Somewhat specific but mostly general
+        • 1-19%: Vague but not completely general
+        • Cannot be 0% - minimum is 1%
 
-        M - REDUNDANCY (0.0-1.0): How much repetition do you observe?
-        • Most texts have some repetition, so typically score 0.2-0.7
-        • High repetition of same ideas: score 0.6-1.0
-        • Some repeated concepts: score 0.3-0.6
-        • Minimal repetition: score 0.1-0.3
-        • Perfect uniqueness is rare - avoid 0.0 unless truly unique
+        M - MULTIPLICITY PERCENTAGE: What percentage (0-100%) of mentions repeat previously stated content?
+        • Calculate: (redundant mentions / total mentions) × 100
+        • 0%: No repetition, all unique information
+        • 25%: Quarter of mentions are repetitive
+        • 50%: Half of mentions repeat previous content
+        • 75-100%: Highly repetitive content
 
-        RESPOND WITH THREE NUMBERS: N|S|M
+        RESPOND FORMAT: N|S|M
+        Where N is integer count, S and M are percentages (1-100 for S, 0-100 for M)
 
-        Examples of good scoring:
-        0.7|0.4|0.3 (relevant topic, some specifics, low repetition)
-        0.5|0.8|0.5 (moderate relevance, very specific, moderate repetition)
-        0.9|0.6|0.4 (highly relevant, detailed, some repetition)
+        Examples:
+        3|65|20 (3 mentions, 65% specific, 20% repetitive)
+        0|1|0 (no mentions, minimal specificity, no repetition)
+        8|85|40 (8 mentions, very specific, moderate repetition)
         """
+        return PromptTemplate(template=template, input_variables=["question", "text"])
+
+    def create_prompt_template(self) -> PromptTemplate:
+        template = """
+    You are analyzing a report against a Kunming–Montreal Global Biodiversity Framework (GBF) question.
+
+    QUESTION: {question}
+
+    TEXT TO ANALYZE:
+    {text}
+
+    DEFINITIONS:
+    - Unit: One sentence OR one bullet point/line item
+    - Mention: A Unit that directly answers or relates to the QUESTION (paraphrases allowed)
+    - Evidence Fields: Five specific criteria to evaluate for each Mention
+
+    ANALYSIS TASKS:
+
+    STEP 1 - IDENTIFY MENTIONS (N):
+    Count all Units that directly answer or relate to the QUESTION.
+    - Include sentences that address the question topic
+    - Include bullet points or line items that are relevant
+    - Count each Unit separately, even if similar
+    - If no relevant Units found, N = 0
+
+    STEP 2 - DEDUPLICATE BY CONTENT (M):
+    Merge Mentions that are factually equivalent:
+    - Combine paraphrases stating the same facts
+    - Merge mentions with same actions, targets, or key values (numbers/timeframes)
+    - Keep one representative Unit per unique fact cluster
+    - M = number of unique factual Mentions after deduplication
+
+    STEP 3 - EVIDENCE SCORING (S):
+    For each unique Mention (M), evaluate these five evidence fields as present (20%) or absent (0%):
+
+    1. action_commitment (0%|20%): 
+    Does the Unit describe a specific action or commitment?
+    Examples: "We will restore wetlands", "We commit to...", "The plan includes..."
+
+    2. numeric_metric_threshold (0%|20%):
+    Does it specify a measurable number, percentage, area, or threshold?
+    Examples: "30% by 2030", "1,200 hectares", "reduce by 50%"
+
+    3. framework_tag (0%|20%):
+    Does it explicitly mention a recognized standard or framework?
+    Examples: "GBF Target 3", "SDG 15", "IUCN", "CBD", "Paris Agreement"
+
+    4. timeframe (0%|20%):
+    Is there an explicit date, year, or temporal horizon?
+    Examples: "by 2030", "annually", "within 10 years", "2025-2030"
+
+    5. method_baseline_evidence (0%|20%):
+    Does it mention measurement methods, baselines, or evidence approaches?
+    Examples: "baseline year 2020", "annual monitoring", "audited by...", "using remote sensing"
+
+    CALCULATION:
+    S = (Sum of all field scores across all M unique Mentions) ÷ (M × 5) × 100
+    This gives the average percentage of evidence fields present across all unique Mentions.
+
+    STRICTNESS RULES:
+    - When uncertain about duplication, merge similar content into one unique item
+    - If an evidence field is questionable or unclear, mark it as absent (0%)
+    - Do not invent or infer information not explicitly stated
+    - Base scoring only on what is directly observable in the text
+
+    RESPONSE FORMAT: N|M|S
+    Where:
+    - N = total number of relevant Units (integer)
+    - M = number of unique factual Mentions after deduplication (integer)  
+    - S = average evidence score percentage (0-100, rounded to nearest whole number)
+
+    EXAMPLES:
+    5|3|60 (5 total mentions, 3 unique after deduplication, 60% average evidence completeness)
+    0|0|0 (no relevant mentions found)
+    8|6|35 (8 mentions, 6 unique, 35% evidence completeness)
+    1|1|80 (1 mention, 1 unique, highly detailed with 4/5 evidence fields present)
+
+    ANALYSIS STEPS SUMMARY:
+    1. Count all relevant Units → N
+    2. Deduplicate by factual content → M  
+    3. Score evidence fields for each unique Mention → calculate S
+    4. Return: N|M|S
+    """
+    
         return PromptTemplate(template=template, input_variables=["question", "text"])
 
     def _get_default_results(self) -> Dict[str, Any]:
         return {
-            "N": 0.0,
-            "S": 0.0,
-            "M": 0.0,
+            "N": 0,      # Integer count of sentences
+            "S": 1.0,    # Minimum 1% specificity
+            "M": 0,    # Can be 0% multiplicity
         }
 
     def _process_response(self, response: str) -> Dict[str, Any]:
         parts = self._safe_split(response)
 
         try:
-            n_value = float(parts[0])
-            if not 0.0 <= n_value <= 1.0:
-                n_value = 0.0
+            n_value = int(parts[0])
+            if n_value < 0:
+                n_value = 0
         except (ValueError, IndexError):
-            n_value = 0.0
+            n_value = 0
 
         try:
             s_value = float(parts[1])
-            if not 0.0 <= s_value <= 1.0:
-                s_value = 0.0
+            if not 1.0 <= s_value <= 100.0:  # S cannot be 0%, minimum 1%
+                s_value = 1.0
         except (ValueError, IndexError):
-            s_value = 0.0
+            s_value = 1.0
 
         try:
-            m_value = float(parts[2])
-            if not 0.0 <= m_value <= 1.0:
-                m_value = 0.0
+            m_value = int(parts[0])
+            if m_value < 0:
+                m_value = 0
         except (ValueError, IndexError):
             m_value = 0.0
 
@@ -508,7 +596,7 @@ class BiodiversityFrameworkAgent(AnalysisAgent):
             return self._get_default_results()
             
     def _validate_results(self, results: Dict[str, Any]) -> bool:
-        """Validate that processed results are reasonable."""
+        """Validate that processed results match exact definitions."""
         if not isinstance(results, dict):
             return False
             
@@ -517,11 +605,20 @@ class BiodiversityFrameworkAgent(AnalysisAgent):
             if key not in results:
                 return False
                 
-        # Validate N, S, M (all should be floats in 0.0-1.0 range)
-        for key in ["N", "S", "M"]:
-            val = results.get(key, -1)
-            if not isinstance(val, (int, float)) or val < 0.0 or val > 1.0:
-                return False
+        # Validate N (should be non-negative integer)
+        n_val = results.get("N", -1)
+        if not isinstance(n_val, int) or n_val < 0:
+            return False
+            
+        # Validate S (should be 1-100 percentage)
+        s_val = results.get("S", 0)
+        if not isinstance(s_val, (int, float)) or s_val < 1.0 or s_val > 100.0:
+            return False
+            
+        # Validate M (should be 0-100 percentage)
+        m_val = results.get("M", -1)
+        if not isinstance(m_val, (int, float)) or m_val < 0.0 or m_val > 100.0:
+            return False
                 
         return True
 
@@ -668,3 +765,4 @@ Relevance: High (direct project references)
     
     print(f"Returning {len(all_content)} real search results")
     return f"Project: {project_name}\n\n" + "\n\n".join(all_content[:max_results])
+
