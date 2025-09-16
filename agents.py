@@ -7,10 +7,13 @@ from langchain.schema import LLMResult
 import re
 import os
 import logging
+
 from datetime import datetime
 from dotenv import load_dotenv
 import time
 from tenacity import retry, stop_after_attempt, wait_exponential
+import io, contextlib
+
 
 # Load environment variables
 load_dotenv()
@@ -344,168 +347,102 @@ class BiodiversityFrameworkAgent(AnalysisAgent):
         super().__init__(llm)
         self.expected_parts = 3  # N, S, M values
 
-    def _create_prompt_template_old(self) -> PromptTemplate:
-        template = """
-        Analyze the text to answer a biodiversity framework question. You must provide exact counts and percentages.
-
-        QUESTION: {question}
-        
-        TEXT:
-        {text}
-        
-        Count and measure the following precisely:
-
-        N - NUMBER OF MENTIONS: Count the exact number of sentences that mention the target content related to this question.
-        • Count each sentence that directly addresses or relates to the question
-        • Count distinct sentences only (do not double-count)
-        • If no sentences mention the topic, N = 0
-        • Provide the actual count as an integer (examples: 0, 1, 3, 7, 12)
-
-        S - SPECIFICITY PERCENTAGE: What percentage (1-100%) reflects how specific the mentions are?
-        • Consider detail level: specific data, metrics, concrete actions, technical terms
-        • 80-100%: Very specific with concrete details, data, metrics
-        • 50-79%: Moderately specific with some concrete information
-        • 20-49%: Somewhat specific but mostly general
-        • 1-19%: Vague but not completely general
-        • Cannot be 0% - minimum is 1%
-
-        M - MULTIPLICITY PERCENTAGE: What percentage (0-100%) of mentions repeat previously stated content?
-        • Calculate: (redundant mentions / total mentions) × 100
-        • 0%: No repetition, all unique information
-        • 25%: Quarter of mentions are repetitive
-        • 50%: Half of mentions repeat previous content
-        • 75-100%: Highly repetitive content
-
-        RESPOND FORMAT: N|S|M
-        Where N is integer count, S and M are percentages (1-100 for S, 0-100 for M)
-
-        Examples:
-        3|65|20 (3 mentions, 65% specific, 20% repetitive)
-        0|1|0 (no mentions, minimal specificity, no repetition)
-        8|85|40 (8 mentions, very specific, moderate repetition)
-        """
-        return PromptTemplate(template=template, input_variables=["question", "text"])
+    
 
     def create_prompt_template(self) -> PromptTemplate:
-        template = """
-    You are analyzing a report against a Kunming–Montreal Global Biodiversity Framework (GBF) question.
+     template = """
+        You are analyzing a report against a Kunming–Montreal Global Biodiversity Framework (GBF) question.
 
-    QUESTION: {question}
+        QUESTION: {question}
 
-    TEXT TO ANALYZE:
-    {text}
+        TEXT TO ANALYZE:
+        {text}
 
-    DEFINITIONS:
-    - Unit: One sentence OR one bullet point/line item
-    - Mention: A Unit that directly answers or relates to the QUESTION (paraphrases allowed)
-    - Evidence Fields: Five specific criteria to evaluate for each Mention
+        DEFINITIONS
+        - Unit: One sentence OR one bullet/line item.
+        - Mention: A Unit that directly answers or relates to the QUESTION (paraphrases allowed).
+        - Evidence Fields (binary): For each unique Mention, evaluate 5 fields as present (1) or absent (0).
 
-    ANALYSIS TASKS:
+        ANALYSIS TASKS
 
-    STEP 1 - IDENTIFY MENTIONS (N):
-    Count all Units that directly answer or relate to the QUESTION.
-    - Include sentences that address the question topic
-    - Include bullet points or line items that are relevant
-    - Count each Unit separately, even if similar
-    - If no relevant Units found, N = 0
+        STEP 1 — IDENTIFY MENTIONS (N)
+        Count all Units that directly answer or relate to the QUESTION.
+        - Include sentences that address the question topic.
+        - Include bullet points or line items that are relevant.
+        - Count each Unit separately, even if similar.
+        - If no relevant Units are found, set N = 0.
 
-    STEP 2 - DEDUPLICATE BY CONTENT (M):
-    Merge Mentions that are factually equivalent:
-    - Combine paraphrases stating the same facts
-    - Merge mentions with same actions, targets, or key values (numbers/timeframes)
-    - Keep one representative Unit per unique fact cluster
-    - M = number of unique factual Mentions after deduplication
+        STEP 2 — DEDUPLICATE BY FACTUAL CONTENT (M)
+        Merge Mentions that are factually equivalent:
+        - Combine paraphrases stating the same facts.
+        - Merge mentions with the same actions, targets, or key values (numbers/timeframes).
+        - Keep one representative Unit per unique fact cluster.
+        - M = number of unique factual Mentions after deduplication.
 
-    STEP 3 - EVIDENCE SCORING (S):
-    For each unique Mention (M), evaluate these five evidence fields as present (20%) or absent (0%):
+        STEP 3 — EVIDENCE SCORING (STRICTLY BINARY)
+        For each unique Mention, output five binary values (0 or 1), one per field:
 
-    1. action_commitment (0%|20%): 
-    Does the Unit describe a specific action or commitment?
-    Examples: "We will restore wetlands", "We commit to...", "The plan includes..."
+        1) action_commitment: Is there a concrete action or commitment? (0/1)
+        2) numeric_metric_threshold: Is a measurable number/percentage/threshold given? (0/1)
+        3) framework_tag: Is a recognized framework/standard explicitly named? (0/1)
+        4) timeframe: Is an explicit date/year/period/frequency given? (0/1)
+        5) method_baseline_evidence: Is a method, baseline, or evidence approach mentioned? (0/1)
 
-    2. numeric_metric_threshold (0%|20%):
-    Does it specify a measurable number, percentage, area, or threshold?
-    Examples: "30% by 2030", "1,200 hectares", "reduce by 50%"
+        STRICTNESS RULES
+        - When uncertain about duplication, merge into one unique item.
+        - If a field is questionable or unclear, score it 0.
+        - Do not infer or assume unstated details; rely only on explicit text.
 
-    3. framework_tag (0%|20%):
-    Does it explicitly mention a recognized standard or framework?
-    Examples: "GBF Target 3", "SDG 15", "IUCN", "CBD", "Paris Agreement"
+        RESPONSE FORMAT (single line, no explanation)
+        N|M|binary_vectors 
 
-    4. timeframe (0%|20%):
-    Is there an explicit date, year, or temporal horizon?
-    Examples: "by 2030", "annually", "within 10 years", "2025-2030"
+        Where:
+        - N = total relevant Units (integer).
+        - M = unique factual Mentions (integer).
+        - binary_vectors  = comma-separated list of 5-digit binary vectors for each Mention.
+        Example: "10110,01000,11100" (one 5-digit vector per Mention, in order).
 
-    5. method_baseline_evidence (0%|20%):
-    Does it mention measurement methods, baselines, or evidence approaches?
-    Examples: "baseline year 2020", "annual monitoring", "audited by...", "using remote sensing"
+        EDGE CASES
+        - If N = 0, return "0|0|".
+        - If M = 0 after deduplication, return "N|0|".
 
-    CALCULATION:
-    S = (Sum of all field scores across all M unique Mentions) ÷ (M × 5) × 100
-    This gives the average percentage of evidence fields present across all unique Mentions.
+        EXAMPLES
+        5|3|10110,01000,11100
+        0|0|
+        8|6|10000,10010,11000,11100,01000,00100
+        1|1|11110
+        """
+     return PromptTemplate(template=template, input_variables=["question", "text"])
 
-    STRICTNESS RULES:
-    - When uncertain about duplication, merge similar content into one unique item
-    - If an evidence field is questionable or unclear, mark it as absent (0%)
-    - Do not invent or infer information not explicitly stated
-    - Base scoring only on what is directly observable in the text
-
-    RESPONSE FORMAT: N|M|S
-    Where:
-    - N = total number of relevant Units (integer)
-    - M = number of unique factual Mentions after deduplication (integer)  
-    - S = average evidence score percentage (0-100, rounded to nearest whole number)
-
-    EXAMPLES:
-    5|3|60 (5 total mentions, 3 unique after deduplication, 60% average evidence completeness)
-    0|0|0 (no relevant mentions found)
-    8|6|35 (8 mentions, 6 unique, 35% evidence completeness)
-    1|1|80 (1 mention, 1 unique, highly detailed with 4/5 evidence fields present)
-
-    ANALYSIS STEPS SUMMARY:
-    1. Count all relevant Units → N
-    2. Deduplicate by factual content → M  
-    3. Score evidence fields for each unique Mention → calculate S
-    4. Return: N|M|S
-    """
-    
-        return PromptTemplate(template=template, input_variables=["question", "text"])
 
     def _get_default_results(self) -> Dict[str, Any]:
         return {
-            "N": 0,      # Integer count of sentences
-            "S": 1.0,    # Minimum 1% specificity
-            "M": 0,    # Can be 0% multiplicity
+            "N": 0,      # Total Units count
+            "M": 0,      # Unique Mentions count  
+            "S": 0,    # Evidence score percentage
         }
 
     def _process_response(self, response: str) -> Dict[str, Any]:
         parts = self._safe_split(response)
 
         try:
-            n_value = int(parts[0])
-            if n_value < 0:
-                n_value = 0
+            n_value = int(parts[0]) if int(parts[0]) >= 0 else 0
         except (ValueError, IndexError):
             n_value = 0
 
         try:
-            s_value = float(parts[1])
-            if not 1.0 <= s_value <= 100.0:  # S cannot be 0%, minimum 1%
-                s_value = 1.0
+            m_value = int(parts[1]) if int(parts[1]) >= 0 else 0
         except (ValueError, IndexError):
-            s_value = 1.0
+            m_value = 0
 
-        try:
-            m_value = int(parts[0])
-            if m_value < 0:
-                m_value = 0
-        except (ValueError, IndexError):
-            m_value = 0.0
+        binary_vectors = parts[2] if len(parts) > 2 else ""
+        vectors = [v.strip() for v in binary_vectors.split(",") if v.strip()]
 
-        return {
-            "N": n_value,
-            "S": s_value,
-            "M": m_value,
-        }
+        # S = sum of all 1s across vectors
+        S = sum(sum(int(ch) for ch in v if ch in "01") for v in vectors)
+
+        return {"N": n_value, "M": m_value, "S": S}
+
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=8))
     def analyze(self, context: Dict[str, Any]) -> Dict[str, Any]:
@@ -551,7 +488,7 @@ class BiodiversityFrameworkAgent(AnalysisAgent):
             logging.debug(f"BiodiversityFrameworkAgent: Text length: {len(text)} characters")
 
             # Create chain with error handling
-            prompt = self._create_prompt_template()
+            prompt = self.create_prompt_template()
             if not prompt:
                 logging.error("BiodiversityFrameworkAgent: Failed to create prompt template")
                 return self._get_default_results()
@@ -635,6 +572,7 @@ def search_project_forums_and_reviews(project_folder_name: str, max_results: int
     Returns:
         Formatted string with forum and review data
     """
+    
     # Input validation
     if not project_folder_name or not isinstance(project_folder_name, str):
         logging.error("Invalid project folder name provided")
@@ -701,10 +639,11 @@ def search_project_forums_and_reviews(project_folder_name: str, max_results: int
     
     for query in search_queries:
         try:
-            print(f"  Searching: {query}")
+           # print(f"  Searching: {query}")
             
             # Perform search
-            results = search.run(query)
+            with contextlib.redirect_stdout(io.StringIO()):
+                results = search.run(query)
             print(f"    Search completed, processing results...")
             
             if results and len(results) > 20:  # Only if we got some content
@@ -723,46 +662,46 @@ def search_project_forums_and_reviews(project_folder_name: str, max_results: int
                 
                 # Create a content block with ALL the results for this query (no truncation)
                 content_block = f"""Source: {source_type}
-Title: Search Results for "{project_name}" - {source_type.replace('_', ' ').title()}
-Content: {results}
-URL: Multiple sources from Google search
-Query_Used: {query}
-Date_Searched: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-Location_Focus: Australia
-Relevance: High (contains '{project_name}')
----
+                Title: Search Results for "{project_name}" - {source_type.replace('_', ' ').title()}
+                Content: {results}
+                URL: Multiple sources from Google search
+                Query_Used: {query}
+                Date_Searched: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+                Location_Focus: Australia
+                Relevance: High (contains '{project_name}')
+                ---
 
-"""
+                """
                 all_content.append(content_block)
-                print(f"    Added {source_type} results block ({len(results)} chars)")
+            #    print(f"    Added {source_type} results block ({len(results)} chars)")
             else:
                 print(f"    No substantial results for query: {query}")
             
         except Exception as e:
-            print(f"  Error searching '{query}': {str(e)}")
+          #  print(f"  Error searching '{query}': {str(e)}")
             continue
     
     # Check if we got real results
-    print(f"Total content blocks collected: {len(all_content)}")
+   # print(f"Total content blocks collected: {len(all_content)}")
     
     if not all_content:
         print("No real results found, providing mock data for demonstration")
         mock_content = f"""Source: Web Search
-Title: {project_name} - Community Discussions
-Content: This project has been discussed in various environmental forums. Community members have shared concerns about biodiversity impacts and conservation measures. The project appears to have mixed reception from environmental groups with some supporting renewable energy initiatives while others express concerns about habitat disruption.
-Query: Sample search
-Relevance: Moderate (general environmental discussion)
----
+        Title: {project_name} - Community Discussions
+        Content: This project has been discussed in various environmental forums. Community members have shared concerns about biodiversity impacts and conservation measures. The project appears to have mixed reception from environmental groups with some supporting renewable energy initiatives while others express concerns about habitat disruption.
+        Query: Sample search
+        Relevance: Moderate (general environmental discussion)
+        ---
 
-Source: Google Reviews
-Title: {project_name} - Environmental Impact Reviews
-Content: Online reviews and discussions about this project's environmental impact. Users have commented on both positive aspects (renewable energy) and concerns (wildlife habitat effects). The project has generated significant community interest and debate.
-Query: Sample search
-Relevance: High (direct project references)
----"""
-        
+        Source: Google Reviews
+        Title: {project_name} - Environmental Impact Reviews
+        Content: Online reviews and discussions about this project's environmental impact. Users have commented on both positive aspects (renewable energy) and concerns (wildlife habitat effects). The project has generated significant community interest and debate.
+        Query: Sample search
+        Relevance: High (direct project references)
+        ---"""
+                
         return f"Project: {project_name}\n\n{mock_content}\n\nNote: This is sample data for demonstration. Real search failed."
     
-    print(f"Returning {len(all_content)} real search results")
+   # print(f"Returning {len(all_content)} real search results")
     return f"Project: {project_name}\n\n" + "\n\n".join(all_content[:max_results])
 

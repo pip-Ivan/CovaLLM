@@ -39,77 +39,43 @@ class BiodiversityCategory(str, Enum):
 class Question(BaseModel):
     text: str
     relevant_excerpts: List[str] = []
-    # Scoring metrics matching exact definitions
-    N: int = 0      # Number of Mentions: Count of sentences that mention the target content (integer, can be 0)
-    S: float = 0.0  # Specificity of Mention: Percentage 0% < S ≤ 100% (cannot be 0%)
-    M: float = 0.0  # Multiplicity: Percentage 0% ≤ M ≤ 100% of mentions that repeat content
+    # Scoring metrics from updated GBF framework analysis
+    N: int = 0      # Total number of relevant Units (sentences/bullet points)
+    M: int = 0      # Number of unique factual Mentions after deduplication  
+    S: int = 0  # Sum evidence score percentage (0-100)
     # Reasoning for scoring decisions
     scoring_rationale: str = ""
 
     def calculate_score(self) -> float:
-        """Calculate question score using N × S × (1 − M) formula with correct definitions"""
-        # Validate inputs match definitions
-        if self.N < 0 or not isinstance(self.N, int):
-            logging.warning(f"Invalid N (should be non-negative integer): N={self.N}")
-            return 0.0
-        if not (0 <= self.S <= 100):
-            logging.warning(f"Invalid S (should be 0% < S ≤ 100%): S={self.S}")
-            return 0.0
-        if not (0 <= self.M <= 100):
-            logging.warning(f"Invalid M (should be 0% ≤ M ≤ 100%): M={self.M}")
-            return 0.0
-            
-        # If no mentions found, score is 0
-        if self.N == 0:
-            return 0.0
-            
-        # Formula: N × S × (1 - M/100) 
-        # N: Count of sentences mentioning target content (integer)
-        # S: Specificity percentage (0% < S ≤ 100%)
-        # M: Multiplicity percentage (0% ≤ M ≤ 100%), so (1 - M/100) rewards low redundancy
-        
-        # Convert percentages to decimals for calculation
-        s_decimal = self.S / 100.0  # Convert S from percentage to 0.0-1.0
-        m_decimal = self.M / 100.0  # Convert M from percentage to 0.0-1.0
-        
-        # Apply formula: N × S × (1 - M)
-        score = self.N * s_decimal * (1.0 - m_decimal)
-        
-        # Scale to 0-100 range for final output
-        final_score = score * 100.0
-        
-        # Ensure score is bounded [0,100]
-        return max(0.0, min(100.0, final_score))
+        """Calculate question score from binary_vectors."""
+        if not isinstance(self.N, int) or self.N < 0: return 0.0
+        if not isinstance(self.M, int) or self.M <= 0: return 0.0
+        if not isinstance(self.S, int) or self.S < 0: return 0.0
+
+    
+        field = 5
+   
+        score = (self.S/ (self.M * field)) 
+        return max(0.0, min(1.0, score))
 
     def add_relevant_excerpt(self, excerpt: str) -> None:
         """Add a relevant excerpt for reference"""
         if excerpt and excerpt.strip():
             self.relevant_excerpts.append(excerpt.strip())
 
-    def update_llm_scores(self, n: int, s: float, m: float, rationale: str = "") -> None:
-        """Update scores with validation matching exact definitions"""
-        # N: Must be non-negative integer (count of sentences)
+    def update_llm_scores(self, n: int, m: int, s: float, rationale: str = "") -> None:
+        """Update scores with validation for N|M|S format"""
+        # N: Total number of relevant Units (non-negative integer)
         self.N = max(0, int(n))
         
-        # S: Must be percentage 0% < S ≤ 100% (cannot be 0%)
-        if s <= 0:
-            self.S = 1.0  # Minimum allowed value
-        else:
-            self.S = max(1.0, min(100.0, float(s)))
-            
-        # M: Must be percentage 0% ≤ M ≤ 100% (can be 0%)
-        self.M = max(0.0, min(100.0, float(m)))
+        # M: Number of unique factual Mentions (non-negative integer)
+        self.M = max(0, int(m))
+        
+        # S: Sum of evidence field scores (non-negative float)
+        self.S = max(0.0, float(s))
         
         self.scoring_rationale = rationale or ""
 
-    # Legacy methods for backward compatibility
-    def update_specificity(self, value: float) -> None:
-        """Legacy method - now expects percentage value 0-100"""
-        self.S = max(1.0, min(100.0, float(value)))  # S cannot be 0%
-
-    def update_multiplicity(self, value: float) -> None:
-        """Legacy method - now expects percentage value 0-100"""  
-        self.M = max(0.0, min(100.0, float(value)))
 
 
 class Subcategory(BaseModel):
@@ -119,24 +85,23 @@ class Subcategory(BaseModel):
     category: BiodiversityCategory
 
     # Aggregated scoring metrics at subcategory level (calculated from questions)
-    N: int = 0      # Sum of sentence counts across questions
-    S: float = 0.0  # Average specificity percentage across questions  
-    M: float = 0.0  # Average multiplicity percentage across questions
+    N: int = 0      # Sum of all N values in that subcategory
+    S: int = 0 # Sum of all S values in that subcategory
+    M: int = 0      # Sum of all M values in that subcategory
     
     # Dollar value allocation for this subcategory
     dollar_value: float = 0.0
 
     def calculate_score(self) -> float:
-        """Calculate subcategory score as mean of question scores (excluding missing)"""
+        """Calculate subcategory score as average of all non-zero Question_Score values"""
         if not self.questions:
             return 0.0
             
-        # Get scores for questions that have been evaluated (N > 0 or explicit scoring)
+        # Get non-zero question scores
         valid_scores = []
         for q in self.questions:
             score = q.calculate_score()
-            # Include questions that have been scored (N > 0 indicates LLM evaluation)
-            if q.N > 0 or score > 0:
+            if score > 0:
                 valid_scores.append(score)
         
         if not valid_scores:
@@ -156,7 +121,8 @@ class Subcategory(BaseModel):
         """Update subcategory aggregated metrics based on question metrics"""
         if not self.questions:
             self.N = 0
-            self.S = self.M = 0.0
+            self.S = 0
+            self.M = 0
             return
 
         # Only aggregate from questions that have been evaluated (N > 0)
@@ -164,37 +130,25 @@ class Subcategory(BaseModel):
         
         if not evaluated_questions:
             self.N = 0
-            self.S = self.M = 0.0
+            self.S = 0
+            self.M = 0
             return
             
-        # Aggregation matching definitions:
-        # N: Sum of sentence counts across all questions
+        # Aggregation matching new definitions:
+        # Subcategory_N = sum of all N values in that subcategory
         self.N = sum(q.N for q in evaluated_questions)
         
-        # S: Average specificity percentage across evaluated questions
-        self.S = sum(q.S for q in evaluated_questions) / len(evaluated_questions)  
+        # Subcategory_S = sum of all S values in that subcategory
+        self.S = sum(q.S for q in evaluated_questions)
         
-        # M: Average multiplicity percentage across evaluated questions
-        self.M = sum(q.M for q in evaluated_questions) / len(evaluated_questions)
+        # Subcategory_M = sum of all M values in that subcategory
+        self.M = sum(q.M for q in evaluated_questions)
         
-        # Ensure values stay within correct bounds
-        self.N = max(0, self.N)  # N is count, cannot be negative
-        self.S = max(1.0, min(100.0, self.S))  # S: 0% < S ≤ 100%
-        self.M = max(0.0, min(100.0, self.M))  # M: 0% ≤ M ≤ 100%
+        # Ensure values are non-negative
+        self.N = max(0, self.N)
+        self.S = max(0.0, self.S)
+        self.M = max(0, self.M)
 
-    def update_specificity(self, value: float) -> None:
-        """Legacy method - now expects percentage value 0-100"""
-        percentage_value = max(1.0, min(100.0, float(value)))  # S cannot be 0%
-        for question in self.questions:
-            question.S = percentage_value
-        self.update_from_questions()  # Recalculate aggregated values
-
-    def update_multiplicity(self, value: float) -> None:
-        """Legacy method - now expects percentage value 0-100"""
-        percentage_value = max(0.0, min(100.0, float(value)))
-        for question in self.questions:
-            question.M = percentage_value
-        self.update_from_questions()  # Recalculate aggregated values
 
 
 class CategoryScore(BaseModel):
@@ -203,25 +157,24 @@ class CategoryScore(BaseModel):
     weight: float = 1.0  # Default weight for category
 
     # Category-level aggregated scoring metrics (calculated from subcategories)
-    N: int = 0      # Sum of sentence counts across subcategories
-    S: float = 0.0  # Average specificity percentage across subcategories
-    M: float = 0.0  # Average multiplicity percentage across subcategories
+    N: int = 0      # Sum of all subcategory N values
+    S: int = 0  # Sum of all subcategory S values
+    M: int = 0      # Sum of all subcategory M values
 
     def get_total_score(self) -> float:
         """Calculate mean score across subcategories (excluding missing)"""
         return self.calculate_score()
 
     def calculate_score(self) -> float:
-        """Calculate category score as mean of subcategory scores (excluding missing)"""
+        """Calculate category score as average of all non-zero Subcategory_Score values"""
         if not self.subcategories:
             return 0.0
             
-        # Get scores for subcategories that have been evaluated
+        # Get non-zero subcategory scores
         valid_scores = []
         for sc in self.subcategories:
             score = sc.calculate_score()
-            # Include subcategories that have valid question evaluations
-            if score > 0:  # Non-zero score indicates some questions were evaluated
+            if score > 0:
                 valid_scores.append(score)
         
         if not valid_scores:
@@ -233,25 +186,34 @@ class CategoryScore(BaseModel):
     def update_from_subcategories(self) -> None:
         """Update category aggregated metrics based on subcategory values"""
         if not self.subcategories:
-            self.N = self.S = self.M = 0.0
+            self.N = 0
+            self.S = 0
+            self.M = 0
             return
 
         # Only aggregate from subcategories that have been evaluated
         evaluated_subcategories = [sc for sc in self.subcategories if sc.N > 0]
         
         if not evaluated_subcategories:
-            self.N = self.S = self.M = 0.0
+            self.N = 0
+            self.S = 0
+            self.M = 0
             return
             
-        # Simple average of N, S, M across evaluated subcategories
-        self.N = sum(sc.N for sc in evaluated_subcategories) / len(evaluated_subcategories)
-        self.S = sum(sc.S for sc in evaluated_subcategories) / len(evaluated_subcategories)
-        self.M = sum(sc.M for sc in evaluated_subcategories) / len(evaluated_subcategories)
+        # Aggregation matching new definitions:
+        # Category_N = sum of all subcategory N
+        self.N = sum(sc.N for sc in evaluated_subcategories)
         
-        # Ensure values stay within 0-1 bounds
-        self.N = max(0.0, min(1.0, self.N))
-        self.S = max(0.0, min(1.0, self.S))
-        self.M = max(0.0, min(1.0, self.M))
+        # Category_S = sum of all subcategory S
+        self.S = sum(sc.S for sc in evaluated_subcategories)
+        
+        # Category_M = sum of all subcategory M
+        self.M = sum(sc.M for sc in evaluated_subcategories)
+        
+        # Ensure values are non-negative
+        self.N = max(0, self.N)
+        self.S = max(0, self.S)
+        self.M = max(0, self.M)
 
     def get_total_dollar_value(self) -> float:
         """Calculate total dollar value for this category"""
@@ -1045,14 +1007,10 @@ def analyze_text_content(
                                     ].questions[k].N = framework_results["N"]
                                     report.category_scores[i].subcategories[
                                         j
-                                    ].questions[k].update_specificity(
-                                        framework_results["S"]
-                                    )
+                                    ].questions[k].S = framework_results["S"]
                                     report.category_scores[i].subcategories[
                                         j
-                                    ].questions[k].update_multiplicity(
-                                        framework_results["M"]
-                                    )
+                                    ].questions[k].M = framework_results["M"]
                                 else:
                                     print(
                                         f"      Framework agent returned no results, falling back to traditional method"
@@ -1075,10 +1033,10 @@ def analyze_text_content(
 
                                     report.category_scores[i].subcategories[
                                         j
-                                    ].questions[k].update_specificity(specificity)
+                                    ].questions[k].S = specificity
                                     report.category_scores[i].subcategories[
                                         j
-                                    ].questions[k].update_multiplicity(multiplicity)
+                                    ].questions[k].M = multiplicity
                                     print(
                                         f"      Fallback analysis: N={estimated_n}, S={specificity:.1f}, M={multiplicity:.1f}"
                                     )
@@ -1103,10 +1061,10 @@ def analyze_text_content(
 
                                 report.category_scores[i].subcategories[j].questions[
                                     k
-                                ].update_specificity(specificity)
+                                ].S = specificity
                                 report.category_scores[i].subcategories[j].questions[
                                     k
-                                ].update_multiplicity(multiplicity)
+                                ].M = multiplicity
                                 print(
                                     f"      Fallback analysis: N={estimated_n}, S={specificity:.1f}, M={multiplicity:.1f}"
                                 )
@@ -1134,10 +1092,10 @@ def analyze_text_content(
                             ].N = estimated_n
                             report.category_scores[i].subcategories[j].questions[
                                 k
-                            ].update_specificity(specificity)
+                            ].S = specificity
                             report.category_scores[i].subcategories[j].questions[
                                 k
-                            ].update_multiplicity(multiplicity)
+                            ].M = multiplicity
                             print(
                                 f"      Traditional analysis: N={estimated_n}, S={specificity:.1f}, M={multiplicity:.1f}"
                             )

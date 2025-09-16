@@ -22,6 +22,13 @@ import seaborn as sns
 import time
 from plotly.subplots import make_subplots
 import matplotlib.colors as mcolors
+#import logging
+
+#logging.basicConfig(
+#    level=logging.WARNING,  # show only important logs in terminal
+#   filename="app.log",     # also save all logs to file
+#    filemode="w",           # overwrite each run (use "a" to append)
+#   format="%(asctime)s - %(levelname)s - %(message)s")
 
 # Load environment variables
 load_dotenv()
